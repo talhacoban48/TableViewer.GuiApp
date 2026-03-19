@@ -569,10 +569,10 @@ class SortFilterHeaderView(QHeaderView):
 
         painter.restore()
 
-        painter.setOpacity(1.0 if (sort_active or sort_hovered) else 0.35)
+        painter.setOpacity(1.0)
         painter.drawPixmap(sort_r, self._sort_px)
 
-        painter.setOpacity(1.0 if (filter_active or filter_hovered) else 0.35)
+        painter.setOpacity(1.0 if (filter_active or filter_hovered) else 0.75)
         painter.drawPixmap(filter_r, self._filter_px)
 
         # Clear icon — only when filter is active
@@ -711,7 +711,7 @@ class TableViewerApp(QMainWindow):
         sb_layout.setSpacing(6)
 
         search_icon_lbl = QLabel()
-        search_icon_lbl.setPixmap(load_pixmap("search.ico"))
+        search_icon_lbl.setPixmap(load_pixmap("search.ico", 22, 22))
         sb_layout.addWidget(search_icon_lbl)
 
         # Cancel button: outside the input, to its left, hidden until there is text
@@ -728,6 +728,7 @@ class TableViewerApp(QMainWindow):
         self.global_search_input = QLineEdit()
         self.global_search_input.setPlaceholderText("Search in all columns…")
         self.global_search_input.setMaximumWidth(300)
+        self.global_search_input.setMinimumHeight(30)
         self.global_search_input.textChanged.connect(self._on_global_search_text_changed)
         sb_layout.addWidget(self.global_search_input)
 
