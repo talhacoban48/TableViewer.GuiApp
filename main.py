@@ -7,10 +7,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTableView, QFileDialog, QAction,
     QStatusBar, QLabel, QMessageBox, QHeaderView, QFrame, QVBoxLayout,
     QHBoxLayout, QLineEdit, QCheckBox, QListWidget, QListWidgetItem,
-    QPushButton, QTabWidget, QWidget, QComboBox,
+    QPushButton, QTabWidget, QWidget, QComboBox, QTabBar,
 )
 from PyQt5.QtGui import QKeySequence, QStandardItemModel, QStandardItem, QIcon, QPainter, QPalette
-from PyQt5.QtCore import Qt, pyqtSignal, QSortFilterProxyModel, QRect, QRectF, QPoint
+from PyQt5.QtCore import Qt, pyqtSignal, QSortFilterProxyModel, QRect, QRectF, QPoint, QTimer
 
 SUPPORTED_EXTENSIONS = ('.xlsx', '.xls', '.csv')
 CSV_ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1254', 'latin-1', 'iso-8859-9']
@@ -60,6 +60,11 @@ class MultiColumnFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._filters: dict = {}   # col_index -> spec dict
+        self._global_filter: str = ""
+
+    def set_global_filter(self, text: str):
+        self._global_filter = text.lower().strip()
+        self.invalidateFilter()
 
     def set_column_filter(self, col: int, spec):
         """Pass spec=None to clear the filter for that column."""
@@ -78,9 +83,24 @@ class MultiColumnFilterProxyModel(QSortFilterProxyModel):
     # -- filtering logic --
 
     def filterAcceptsRow(self, source_row: int, source_parent) -> bool:
+        model = self.sourceModel()
+        n_cols = model.columnCount()
+
+        # Global search: at least one column must contain the text
+        if self._global_filter:
+            found = any(
+                self._global_filter in (model.data(
+                    model.index(source_row, c, source_parent), Qt.DisplayRole
+                ) or "").lower()
+                for c in range(n_cols)
+            )
+            if not found:
+                return False
+
+        # Per-column filters
         for col, spec in self._filters.items():
-            idx = self.sourceModel().index(source_row, col, source_parent)
-            val = self.sourceModel().data(idx, Qt.DisplayRole) or ""
+            idx = model.index(source_row, col, source_parent)
+            val = model.data(idx, Qt.DisplayRole) or ""
             if spec['type'] == 'values':
                 if val not in spec['values']:
                     return False
@@ -379,14 +399,15 @@ class FilterPopup(QFrame):
 
 class SortFilterHeaderView(QHeaderView):
 
-    sort_requested   = pyqtSignal(int, int)   # col, Qt.SortOrder
-    filter_requested = pyqtSignal(int)        # col
+    sort_requested         = pyqtSignal(int, int)   # col, Qt.SortOrder
+    filter_requested       = pyqtSignal(int)        # col
+    clear_filter_requested = pyqtSignal(int)        # col
 
     _ICON_SIZE = 16
     _ICON_GAP  = 6    # px gap between icons and from right edge
     _BTN_PAD   = 3    # extra padding around icon for the button background
-    # Extra horizontal space reserved for the two icons inside each section
-    _ICON_RESERVE = _ICON_SIZE * 2 + _ICON_GAP * 3 + 16  # + left text padding
+    # Space for 3 icons (sort + filter + clear) — clear slot always reserved
+    _ICON_RESERVE = _ICON_SIZE * 3 + _ICON_GAP * 4 + 16
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
@@ -396,14 +417,15 @@ class SortFilterHeaderView(QHeaderView):
 
         self._sort_px   = load_pixmap("sort.ico",   self._ICON_SIZE, self._ICON_SIZE)
         self._filter_px = load_pixmap("filter.ico", self._ICON_SIZE, self._ICON_SIZE)
+        self._clear_px  = load_pixmap("cancel.ico", self._ICON_SIZE, self._ICON_SIZE)
 
-        self._sort_col:    int = -1
-        self._sort_order:  int = Qt.AscendingOrder
+        self._sort_col:      int = -1
+        self._sort_order:    int = Qt.AscendingOrder
         self._filtered_cols: set = set()
 
         # Hover tracking
         self._hover_col:   int = -1
-        self._hover_which: str = ''   # 'sort' | 'filter' | ''
+        self._hover_which: str = ''   # 'sort' | 'filter' | 'clear' | ''
         self.viewport().setMouseTracking(True)
 
     # -- public API --
@@ -427,12 +449,14 @@ class SortFilterHeaderView(QHeaderView):
         return QRect(x, 0, self.sectionSize(logical), self.height())
 
     def _icon_rects(self, sec: QRect):
-        """Return (sort_rect, filter_rect) aligned to the right of the section."""
+        """Return (sort_rect, filter_rect, clear_rect) right-aligned in the section.
+        clear_rect is always calculated (shown only when a filter is active)."""
         sz, gap = self._ICON_SIZE, self._ICON_GAP
         cy = sec.center().y()
-        filter_r = QRect(sec.right() - gap - sz,              cy - sz // 2, sz, sz)
-        sort_r   = QRect(filter_r.left() - gap - sz,          cy - sz // 2, sz, sz)
-        return sort_r, filter_r
+        clear_r  = QRect(sec.right()         - gap - sz, cy - sz // 2, sz, sz)
+        filter_r = QRect(clear_r.left()      - gap - sz, cy - sz // 2, sz, sz)
+        sort_r   = QRect(filter_r.left()     - gap - sz, cy - sz // 2, sz, sz)
+        return sort_r, filter_r, clear_r
 
     # -- painting --
 
@@ -446,17 +470,18 @@ class SortFilterHeaderView(QHeaderView):
         super().paintSection(painter, rect, logical)
         painter.restore()
 
-        # ── 3. Icon buttons ──
+        # ── Icon buttons ──
         if rect.width() < self._ICON_RESERVE:
             return
 
-        sort_r, filter_r = self._icon_rects(rect)
+        sort_r, filter_r, clear_r = self._icon_rects(rect)
         pad = self._BTN_PAD
 
         sort_active    = (self._sort_col == logical)
         sort_hovered   = (self._hover_col == logical and self._hover_which == 'sort')
         filter_active  = (logical in self._filtered_cols)
         filter_hovered = (self._hover_col == logical and self._hover_which == 'filter')
+        clear_hovered  = (self._hover_col == logical and self._hover_which == 'clear')
 
         pal        = self.palette()
         btn_base   = pal.color(QPalette.Button)
@@ -482,6 +507,8 @@ class SortFilterHeaderView(QHeaderView):
 
         _draw_btn(sort_r,   sort_hovered,   sort_active,   use_accent=False)
         _draw_btn(filter_r, filter_hovered, filter_active, use_accent=True)
+        if filter_active:
+            _draw_btn(clear_r, clear_hovered, active=True, use_accent=False)
 
         painter.restore()
 
@@ -490,6 +517,11 @@ class SortFilterHeaderView(QHeaderView):
 
         painter.setOpacity(1.0 if (filter_active or filter_hovered) else 0.35)
         painter.drawPixmap(filter_r, self._filter_px)
+
+        # Clear icon — only when filter is active
+        if filter_active:
+            painter.setOpacity(1.0)
+            painter.drawPixmap(clear_r, self._clear_px)
 
         painter.setOpacity(1.0)
 
@@ -501,8 +533,10 @@ class SortFilterHeaderView(QHeaderView):
         old = (self._hover_col, self._hover_which)
 
         if logical >= 0:
-            sort_r, filter_r = self._icon_rects(self._section_rect(logical))
-            if filter_r.contains(pos):
+            sort_r, filter_r, clear_r = self._icon_rects(self._section_rect(logical))
+            if logical in self._filtered_cols and clear_r.contains(pos):
+                self._hover_col, self._hover_which = logical, 'clear'
+            elif filter_r.contains(pos):
                 self._hover_col, self._hover_which = logical, 'filter'
             elif sort_r.contains(pos):
                 self._hover_col, self._hover_which = logical, 'sort'
@@ -526,7 +560,11 @@ class SortFilterHeaderView(QHeaderView):
             pos     = event.pos()
             logical = self.logicalIndexAt(pos)
             if logical >= 0:
-                sort_r, filter_r = self._icon_rects(self._section_rect(logical))
+                sort_r, filter_r, clear_r = self._icon_rects(self._section_rect(logical))
+
+                if logical in self._filtered_cols and clear_r.contains(pos):
+                    self.clear_filter_requested.emit(logical)
+                    return
 
                 if filter_r.contains(pos):
                     self.filter_requested.emit(logical)
@@ -561,6 +599,8 @@ class TableViewerApp(QMainWindow):
         self._source_model     = None
         self._proxy_model      = None
         self._filter_popup     = None   # keep reference – prevents GC
+        self._excel_sheets: list  = []  # sheet names for the open Excel file
+        self._sheet_cache:  dict  = {}  # sheet_name -> DataFrame (lazy)
         self._init_ui()
 
     def _init_ui(self):
@@ -572,6 +612,7 @@ class TableViewerApp(QMainWindow):
         self._header = SortFilterHeaderView()
         self._header.sort_requested.connect(self._on_sort_requested)
         self._header.filter_requested.connect(self._show_filter_popup)
+        self._header.clear_filter_requested.connect(self._on_clear_filter)
 
         self.table_view = QTableView(self)
         self.table_view.setHorizontalHeader(self._header)
@@ -579,7 +620,54 @@ class TableViewerApp(QMainWindow):
         self.table_view.setSortingEnabled(False)
         self.table_view.setAlternatingRowColors(True)
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
-        self.setCentralWidget(self.table_view)
+
+        # ── Search bar ──
+        search_bar = QWidget()
+        search_bar.setContentsMargins(0, 0, 0, 0)
+        sb_layout = QHBoxLayout(search_bar)
+        sb_layout.setContentsMargins(6, 4, 6, 4)
+        sb_layout.setSpacing(4)
+
+        search_icon_lbl = QLabel()
+        search_icon_lbl.setPixmap(load_pixmap("search.ico"))
+        sb_layout.addWidget(search_icon_lbl)
+
+        self.global_search_input = QLineEdit()
+        self.global_search_input.setPlaceholderText("Search in all columns…")
+        self.global_search_input.setMaximumWidth(300)
+        self.global_search_input.textChanged.connect(self._on_global_search_text_changed)
+
+        # Clear button embedded inside the input field (trailing position)
+        self.search_clear_action = self.global_search_input.addAction(
+            load_icon("cancel.ico"), QLineEdit.TrailingPosition
+        )
+        self.search_clear_action.setVisible(False)
+        self.search_clear_action.triggered.connect(self._clear_global_search)
+
+        sb_layout.addWidget(self.global_search_input)
+        sb_layout.addStretch()
+
+        # 500 ms debounce timer
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(500)
+        self._search_timer.timeout.connect(self._apply_global_search)
+
+        # Sheet tab bar – shown only for multi-sheet Excel files
+        self.sheet_tab_bar = QTabBar()
+        self.sheet_tab_bar.setShape(QTabBar.RoundedSouth)
+        self.sheet_tab_bar.setVisible(False)
+        self.sheet_tab_bar.currentChanged.connect(self._on_sheet_tab_changed)
+
+        # Central widget: search bar → table → sheet tabs
+        container = QWidget()
+        c_layout = QVBoxLayout(container)
+        c_layout.setContentsMargins(0, 0, 0, 0)
+        c_layout.setSpacing(0)
+        c_layout.addWidget(search_bar)
+        c_layout.addWidget(self.table_view)
+        c_layout.addWidget(self.sheet_tab_bar)
+        self.setCentralWidget(container)
 
         self.status_label = QLabel("No file loaded")
         status_bar = QStatusBar(self)
@@ -622,6 +710,26 @@ class TableViewerApp(QMainWindow):
     # Sort / Filter
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Global search
+    # ------------------------------------------------------------------
+
+    def _on_global_search_text_changed(self, text: str):
+        self.search_clear_action.setVisible(bool(text))
+        self._search_timer.start()   # restart 500 ms countdown
+
+    def _apply_global_search(self):
+        if self._proxy_model:
+            self._proxy_model.set_global_filter(self.global_search_input.text())
+            self._update_status()
+
+    def _clear_global_search(self):
+        self.global_search_input.clear()   # triggers textChanged → timer → apply
+
+    # ------------------------------------------------------------------
+    # Sort / Filter
+    # ------------------------------------------------------------------
+
     def _on_sort_requested(self, col: int, order: int):
         if self._proxy_model:
             self._proxy_model.sort(col, order)
@@ -657,6 +765,40 @@ class TableViewerApp(QMainWindow):
         self._update_status()
 
     # ------------------------------------------------------------------
+    # Sheet tabs
+    # ------------------------------------------------------------------
+
+    def _setup_sheet_tabs(self, sheets: list):
+        """Populate the sheet tab bar. Hide it when there is ≤1 sheet."""
+        self.sheet_tab_bar.blockSignals(True)
+        while self.sheet_tab_bar.count():
+            self.sheet_tab_bar.removeTab(0)
+        for name in sheets:
+            self.sheet_tab_bar.addTab(name)
+        self.sheet_tab_bar.setCurrentIndex(0)
+        self.sheet_tab_bar.setVisible(len(sheets) > 1)
+        self.sheet_tab_bar.blockSignals(False)
+
+    def _on_sheet_tab_changed(self, index: int):
+        if not self._excel_sheets or index < 0:
+            return
+        sheet_name = self._excel_sheets[index]
+        if sheet_name not in self._sheet_cache:
+            try:
+                df = pd.read_excel(self.current_file_path, sheet_name=sheet_name)
+                self._sheet_cache[sheet_name] = df
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not load sheet '{sheet_name}':\n{e}")
+                return
+        self._load_dataframe(self._sheet_cache[sheet_name],
+                             self.current_file_path, sheet_name=sheet_name)
+
+    def _on_clear_filter(self, col: int):
+        self._proxy_model.set_column_filter(col, None)
+        self._header.mark_filter_active(col, False)
+        self._update_status()
+
+    # ------------------------------------------------------------------
     # File loading
     # ------------------------------------------------------------------
 
@@ -675,16 +817,26 @@ class TableViewerApp(QMainWindow):
         ext = os.path.splitext(file_path)[1].lower()
         try:
             if ext in ('.xlsx', '.xls'):
-                df = pd.read_excel(file_path)
+                xf = pd.ExcelFile(file_path)
+                sheets = xf.sheet_names
+                self._excel_sheets = sheets
+                self._sheet_cache  = {}
+                df = xf.parse(sheets[0])
+                self._sheet_cache[sheets[0]] = df
+                self._setup_sheet_tabs(sheets)
+                self._load_dataframe(df, file_path, sheet_name=sheets[0])
             elif ext == '.csv':
+                self._excel_sheets = []
+                self._sheet_cache  = {}
+                self._setup_sheet_tabs([])
                 df = self._read_csv_with_auto_encoding(file_path)
+                self._load_dataframe(df, file_path)
             else:
                 QMessageBox.warning(
                     self, "Unsupported File",
                     f"Unsupported file type: {ext}\n\nSupported: .xlsx, .xls, .csv"
                 )
                 return
-            self._load_dataframe(df, file_path)
         except Exception as e:
             QMessageBox.critical(
                 self, "Error Opening File",
@@ -702,7 +854,7 @@ class TableViewerApp(QMainWindow):
             f"Tried encodings: {', '.join(CSV_ENCODINGS)}"
         )
 
-    def _load_dataframe(self, df: pd.DataFrame, file_path: str):
+    def _load_dataframe(self, df: pd.DataFrame, file_path: str, sheet_name: str = ""):
         self.df                = df
         self.current_file_path = file_path
 
@@ -731,8 +883,18 @@ class TableViewerApp(QMainWindow):
 
         self._header.reset_state()
 
+        # Reset global search
+        self._search_timer.stop()
+        self.global_search_input.blockSignals(True)
+        self.global_search_input.clear()
+        self.global_search_input.blockSignals(False)
+        self.search_clear_action.setVisible(False)
+
         file_name = os.path.basename(file_path)
-        self.setWindowTitle(f"Table Viewer — {file_name}")
+        title = f"Table Viewer — {file_name}"
+        if sheet_name:
+            title += f"  [{sheet_name}]"
+        self.setWindowTitle(title)
         self._update_status()
 
     def _ensure_header_column_widths(self):
@@ -778,12 +940,28 @@ class TableViewerApp(QMainWindow):
             self, "Save as Excel", self._default_save_name('.xlsx'),
             "Excel Files (*.xlsx);;All Files (*)"
         )
-        if file_path:
-            try:
+        if not file_path:
+            return
+        try:
+            if len(self._excel_sheets) > 1:
+                # Load any sheets not yet cached, then write all
+                with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                    for sheet_name in self._excel_sheets:
+                        if sheet_name not in self._sheet_cache:
+                            self._sheet_cache[sheet_name] = pd.read_excel(
+                                self.current_file_path, sheet_name=sheet_name
+                            )
+                        self._sheet_cache[sheet_name].to_excel(
+                            writer, sheet_name=sheet_name, index=False
+                        )
+                self.statusBar().showMessage(
+                    f"Saved {len(self._excel_sheets)} sheets successfully.", 3000
+                )
+            else:
                 self.df.to_excel(file_path, index=False)
                 self.statusBar().showMessage("Saved successfully.", 3000)
-            except Exception as e:
-                QMessageBox.critical(self, "Error Saving File", str(e))
+        except Exception as e:
+            QMessageBox.critical(self, "Error Saving File", str(e))
 
     def save_as_csv(self):
         if self.df is None:
