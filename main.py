@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QStatusBar, QLabel, QMessageBox, QHeaderView, QFrame, QVBoxLayout,
     QHBoxLayout, QLineEdit, QCheckBox, QListWidget, QListWidgetItem,
     QPushButton, QTabWidget, QWidget, QComboBox, QTabBar,
-    QColorDialog, QSpinBox,
+    QColorDialog, QSpinBox, QMenu, QInputDialog,
 )
 from PyQt5.QtGui import (
     QKeySequence, QStandardItemModel, QStandardItem, QIcon,
@@ -636,6 +636,8 @@ class TableViewerApp(QMainWindow):
         self.table_view.setAlternatingRowColors(True)
         self.table_view.setSelectionBehavior(QTableView.SelectItems)
         self.table_view.setSelectionMode(QTableView.ExtendedSelection)
+        self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_view.customContextMenuRequested.connect(self._show_context_menu)
 
         # ── Search bar ──
         search_bar = QWidget()
@@ -1224,6 +1226,227 @@ class TableViewerApp(QMainWindow):
                 sheet_name = self._excel_sheets[idx]
                 if sheet_name in self._sheet_cache:
                     self._sheet_cache[sheet_name].iat[row, col] = value
+
+    # ------------------------------------------------------------------
+    # Context Menu (right-click)
+    # ------------------------------------------------------------------
+
+    def _show_context_menu(self, pos: QPoint):
+        if self._source_model is None:
+            return
+
+        selected = self.table_view.selectionModel().selectedIndexes()
+        if not selected:
+            return
+
+        # Map proxy indexes to source rows/cols
+        proxy = self._proxy_model
+        source_rows = sorted({proxy.mapToSource(i).row() for i in selected})
+        source_cols = sorted({proxy.mapToSource(i).column() for i in selected})
+
+        insert_row = source_rows[-1] + 1   # insert after last selected row
+        insert_col = source_cols[-1] + 1   # insert after last selected col
+
+        menu = QMenu(self)
+
+        # Delete rows
+        row_label = f"Delete {len(source_rows)} Row(s)" if len(source_rows) > 1 else "Delete Row"
+        act_del_rows = menu.addAction(row_label)
+
+        # Add row (below selection)
+        act_add_row = menu.addAction("Add Row Below")
+
+        menu.addSeparator()
+
+        # Delete columns
+        col_label = f"Delete {len(source_cols)} Column(s)" if len(source_cols) > 1 else "Delete Column"
+        act_del_cols = menu.addAction(col_label)
+
+        # Add column (right of selection)
+        act_add_col = menu.addAction("Add Column Right…")
+
+        action = menu.exec_(self.table_view.viewport().mapToGlobal(pos))
+
+        if action == act_del_rows:
+            self._delete_rows(source_rows)
+        elif action == act_add_row:
+            self._add_row(insert_row)
+        elif action == act_del_cols:
+            self._delete_columns(source_cols)
+        elif action == act_add_col:
+            self._add_column(insert_col)
+
+    def _delete_rows(self, source_rows: list):
+        """Remove rows (sorted descending) from model, df, cache, and format dicts."""
+        try:
+            sheet_name = self._current_sheet_name()
+
+            for row in sorted(source_rows, reverse=True):
+                self._source_model.removeRow(row)
+                if self.df is not None and row < len(self.df):
+                    self.df = self.df.drop(self.df.index[row]).reset_index(drop=True)
+                if sheet_name and sheet_name in self._sheet_cache:
+                    df_c = self._sheet_cache[sheet_name]
+                    if row < len(df_c):
+                        self._sheet_cache[sheet_name] = df_c.drop(df_c.index[row]).reset_index(drop=True)
+
+            # Rebuild format/user_changes keys (row indices shifted)
+            for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
+                             self._user_changes.get(sheet_name, {})):
+                self._remap_rows(fmt_dict, source_rows)
+
+            self._update_status()
+        except Exception:
+            traceback.print_exc()
+
+    def _delete_columns(self, source_cols: list):
+        """Remove columns (sorted descending) from model, df, cache, and format dicts."""
+        try:
+            sheet_name = self._current_sheet_name()
+
+            for col in sorted(source_cols, reverse=True):
+                self._source_model.removeColumn(col)
+                if self.df is not None and col < len(self.df.columns):
+                    self.df = self.df.drop(self.df.columns[col], axis=1)
+                if sheet_name and sheet_name in self._sheet_cache:
+                    df_c = self._sheet_cache[sheet_name]
+                    if col < len(df_c.columns):
+                        self._sheet_cache[sheet_name] = df_c.drop(df_c.columns[col], axis=1)
+
+            # Rebuild format/user_changes keys (col indices shifted)
+            for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
+                             self._user_changes.get(sheet_name, {})):
+                self._remap_cols(fmt_dict, source_cols)
+
+            self._update_status()
+        except Exception:
+            traceback.print_exc()
+
+    def _add_row(self, insert_at: int):
+        """Insert a blank row at insert_at (after last selected row)."""
+        try:
+            import pandas as pd
+            sheet_name = self._current_sheet_name()
+
+            # Insert into model
+            col_count = self._source_model.columnCount()
+            items = [QStandardItem("") for _ in range(col_count)]
+            for it in items:
+                it.setEditable(True)
+            self._source_model.insertRow(insert_at, items)
+
+            # Insert into df
+            if self.df is not None:
+                blank = pd.DataFrame([[""] * len(self.df.columns)], columns=self.df.columns)
+                top = self.df.iloc[:insert_at]
+                bot = self.df.iloc[insert_at:]
+                self.df = pd.concat([top, blank, bot], ignore_index=True)
+
+            # Insert into cache
+            if sheet_name and sheet_name in self._sheet_cache:
+                df_c = self._sheet_cache[sheet_name]
+                blank = pd.DataFrame([[""] * len(df_c.columns)], columns=df_c.columns)
+                top = df_c.iloc[:insert_at]
+                bot = df_c.iloc[insert_at:]
+                self._sheet_cache[sheet_name] = pd.concat([top, blank, bot], ignore_index=True)
+
+            # Shift format keys >= insert_at down by 1
+            for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
+                             self._user_changes.get(sheet_name, {})):
+                self._shift_rows(fmt_dict, insert_at)
+
+            self._update_status()
+        except Exception:
+            traceback.print_exc()
+
+    def _add_column(self, insert_at: int):
+        """Prompt for a name and insert a new empty column at insert_at."""
+        try:
+            name, ok = QInputDialog.getText(self, "Add Column", "Column name:")
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+
+            sheet_name = self._current_sheet_name()
+
+            # Insert into model
+            self._source_model.insertColumn(insert_at)
+            self._source_model.setHorizontalHeaderItem(insert_at, QStandardItem(name))
+            for row in range(self._source_model.rowCount()):
+                item = QStandardItem("")
+                item.setEditable(True)
+                self._source_model.setItem(row, insert_at, item)
+
+            # Insert into df
+            if self.df is not None:
+                self.df.insert(insert_at, name, "")
+
+            # Insert into cache
+            if sheet_name and sheet_name in self._sheet_cache:
+                self._sheet_cache[sheet_name].insert(insert_at, name, "")
+
+            # Shift format keys >= insert_at right by 1
+            for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
+                             self._user_changes.get(sheet_name, {})):
+                self._shift_cols(fmt_dict, insert_at)
+
+            self._update_status()
+        except Exception:
+            traceback.print_exc()
+
+    # helpers ---------------------------------------------------------------
+
+    def _current_sheet_name(self) -> str:
+        """Return active sheet name, or '' for CSV / single-sheet xlsx."""
+        if self._excel_sheets:
+            idx = self.sheet_tab_bar.currentIndex()
+            if 0 <= idx < len(self._excel_sheets):
+                return self._excel_sheets[idx]
+        return ""
+
+    @staticmethod
+    def _remap_rows(fmt_dict: dict, deleted_rows: list):
+        """Rebuild (row, col) keys after deleting rows."""
+        deleted = set(deleted_rows)
+        new_dict = {}
+        for (r, c), v in fmt_dict.items():
+            if r in deleted:
+                continue
+            shift = sum(1 for d in deleted if d < r)
+            new_dict[(r - shift, c)] = v
+        fmt_dict.clear()
+        fmt_dict.update(new_dict)
+
+    @staticmethod
+    def _remap_cols(fmt_dict: dict, deleted_cols: list):
+        """Rebuild (row, col) keys after deleting columns."""
+        deleted = set(deleted_cols)
+        new_dict = {}
+        for (r, c), v in fmt_dict.items():
+            if c in deleted:
+                continue
+            shift = sum(1 for d in deleted if d < c)
+            new_dict[(r, c - shift)] = v
+        fmt_dict.clear()
+        fmt_dict.update(new_dict)
+
+    @staticmethod
+    def _shift_rows(fmt_dict: dict, insert_at: int):
+        """Shift all row keys >= insert_at down by 1 (after row insertion)."""
+        new_dict = {}
+        for (r, c), v in fmt_dict.items():
+            new_dict[(r + 1 if r >= insert_at else r, c)] = v
+        fmt_dict.clear()
+        fmt_dict.update(new_dict)
+
+    @staticmethod
+    def _shift_cols(fmt_dict: dict, insert_at: int):
+        """Shift all col keys >= insert_at right by 1 (after column insertion)."""
+        new_dict = {}
+        for (r, c), v in fmt_dict.items():
+            new_dict[(r, c + 1 if c >= insert_at else c)] = v
+        fmt_dict.clear()
+        fmt_dict.update(new_dict)
 
     # ------------------------------------------------------------------
     # Sort / Filter
