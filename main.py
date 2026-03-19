@@ -618,6 +618,7 @@ class TableViewerApp(QMainWindow):
         self._fmt_fg_color: QColor    = QColor(Qt.black)
         self._fmt_bg_color: QColor    = QColor(Qt.white)
         self._init_ui()
+        self._load_blank_sheet()
 
     def _init_ui(self):
         self.setGeometry(200, 150, 1100, 680)
@@ -737,6 +738,22 @@ class TableViewerApp(QMainWindow):
         undo_action.setShortcut(QKeySequence.Undo)
         undo_action.triggered.connect(self._undo)
         self.addAction(undo_action)
+
+        # Cut / Copy / Paste
+        copy_action = QAction("Copy", self)
+        copy_action.setShortcut(QKeySequence.Copy)
+        copy_action.triggered.connect(self._copy_selection)
+        self.addAction(copy_action)
+
+        cut_action = QAction("Cut", self)
+        cut_action.setShortcut(QKeySequence.Cut)
+        cut_action.triggered.connect(self._cut_selection)
+        self.addAction(cut_action)
+
+        paste_action = QAction("Paste", self)
+        paste_action.setShortcut(QKeySequence.Paste)
+        paste_action.triggered.connect(self._paste_selection)
+        self.addAction(paste_action)
 
     # ------------------------------------------------------------------
     # Format toolbar
@@ -1250,6 +1267,13 @@ class TableViewerApp(QMainWindow):
 
         menu = QMenu(self)
 
+        # Cut / Copy / Paste
+        act_copy  = menu.addAction("Copy\tCtrl+C")
+        act_cut   = menu.addAction("Cut\tCtrl+X")
+        act_paste = menu.addAction("Paste\tCtrl+V")
+
+        menu.addSeparator()
+
         # Delete rows
         row_label = f"Delete {len(source_rows)} Row(s)" if len(source_rows) > 1 else "Delete Row"
         act_del_rows = menu.addAction(row_label)
@@ -1268,7 +1292,13 @@ class TableViewerApp(QMainWindow):
 
         action = menu.exec_(self.table_view.viewport().mapToGlobal(pos))
 
-        if action == act_del_rows:
+        if action == act_copy:
+            self._copy_selection()
+        elif action == act_cut:
+            self._cut_selection()
+        elif action == act_paste:
+            self._paste_selection()
+        elif action == act_del_rows:
             self._delete_rows(source_rows)
         elif action == act_add_row:
             self._add_row(insert_row)
@@ -1276,6 +1306,94 @@ class TableViewerApp(QMainWindow):
             self._delete_columns(source_cols)
         elif action == act_add_col:
             self._add_column(insert_col)
+
+    # ------------------------------------------------------------------
+    # Cut / Copy / Paste
+    # ------------------------------------------------------------------
+
+    def _copy_selection(self):
+        """Copy selected cells to clipboard as tab-separated text (Excel-compatible)."""
+        if self._source_model is None:
+            return
+        indexes = self.table_view.selectionModel().selectedIndexes()
+        if not indexes:
+            return
+        src = [self._proxy_model.mapToSource(i) for i in indexes]
+        rows = sorted({i.row() for i in src})
+        cols = sorted({i.column() for i in src})
+        cell_map = {(i.row(), i.column()): self._source_model.data(i, Qt.DisplayRole) or ""
+                    for i in src}
+        text = "\n".join(
+            "\t".join(cell_map.get((r, c), "") for c in cols)
+            for r in rows
+        )
+        QApplication.clipboard().setText(text)
+
+    def _cut_selection(self):
+        """Copy selected cells then clear their content."""
+        self._copy_selection()
+        if self._source_model is None:
+            return
+        indexes = self.table_view.selectionModel().selectedIndexes()
+        if not indexes:
+            return
+        self._source_model.blockSignals(True)
+        for proxy_idx in indexes:
+            src = self._proxy_model.mapToSource(proxy_idx)
+            item = self._source_model.item(src.row(), src.column())
+            if item:
+                item.setText("")
+        self._source_model.blockSignals(False)
+        # Sync cleared values to df / cache
+        for proxy_idx in indexes:
+            src = self._proxy_model.mapToSource(proxy_idx)
+            r, c = src.row(), src.column()
+            if self.df is not None and r < len(self.df) and c < len(self.df.columns):
+                self.df.iat[r, c] = ""
+            sheet_name = self._current_sheet_name()
+            if sheet_name and sheet_name in self._sheet_cache:
+                df_c = self._sheet_cache[sheet_name]
+                if r < len(df_c) and c < len(df_c.columns):
+                    df_c.iat[r, c] = ""
+
+    def _paste_selection(self):
+        """Paste clipboard text starting at the top-left selected cell."""
+        if self._source_model is None:
+            return
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        indexes = self.table_view.selectionModel().selectedIndexes()
+        if not indexes:
+            return
+        src = [self._proxy_model.mapToSource(i) for i in indexes]
+        start_row = min(i.row() for i in src)
+        start_col = min(i.column() for i in src)
+        rows_data = text.split("\n")
+        sheet_name = self._current_sheet_name()
+        self._source_model.blockSignals(True)
+        for dr, line in enumerate(rows_data):
+            cells = line.split("\t")
+            r = start_row + dr
+            if r >= self._source_model.rowCount():
+                break
+            for dc, val in enumerate(cells):
+                c = start_col + dc
+                if c >= self._source_model.columnCount():
+                    break
+                item = self._source_model.item(r, c)
+                if item is None:
+                    item = QStandardItem()
+                    item.setEditable(True)
+                    self._source_model.setItem(r, c, item)
+                item.setText(val)
+                if self.df is not None and r < len(self.df) and c < len(self.df.columns):
+                    self.df.iat[r, c] = val
+                if sheet_name and sheet_name in self._sheet_cache:
+                    df_c = self._sheet_cache[sheet_name]
+                    if r < len(df_c) and c < len(df_c.columns):
+                        df_c.iat[r, c] = val
+        self._source_model.blockSignals(False)
 
     def _delete_rows(self, source_rows: list):
         """Remove rows (sorted descending) from model, df, cache, and format dicts."""
@@ -1611,6 +1729,18 @@ class TableViewerApp(QMainWindow):
             f"Tried encodings: {', '.join(CSV_ENCODINGS)}"
         )
 
+    def _load_blank_sheet(self, rows: int = 10, cols: int = 5):
+        """Start the app with an empty grid when no file has been opened."""
+        col_names = [chr(ord('A') + i) for i in range(cols)]
+        df = pd.DataFrame("", index=range(rows), columns=col_names)
+        self._excel_sheets      = []
+        self._sheet_cache       = {}
+        self._all_sheet_formats = {}
+        self._user_changes      = {}
+        self._structural_ops    = []
+        self._setup_sheet_tabs([])
+        self._load_dataframe(df, "")
+
     def _load_dataframe(self, df: pd.DataFrame, file_path: str, sheet_name: str = ""):
         self.df                = df
         self.current_file_path = file_path
@@ -1793,8 +1923,28 @@ class TableViewerApp(QMainWindow):
                 self.current_file_path = file_path
                 self._structural_ops = []
             else:
-                # CSV source: write fresh workbook via pandas
-                self.df.to_excel(file_path, index=False)
+                # Blank sheet or CSV source: build workbook via openpyxl so
+                # user formatting (_user_changes) is applied from the first save.
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                sheet_name = self._excel_sheets[0] if self._excel_sheets else '__csv__'
+                df = self.df
+
+                for ci, col_name in enumerate(df.columns, 1):
+                    ws.cell(row=1, column=ci).value = str(col_name)
+                for ri, (_, row_data) in enumerate(df.iterrows(), 2):
+                    for ci, val in enumerate(row_data, 1):
+                        ws.cell(row=ri, column=ci).value = (
+                            None if pd.isna(val) else val
+                        )
+
+                user_fmt = self._user_changes.get(sheet_name, {})
+                for (r, c), fmt in user_fmt.items():
+                    self._apply_fmt_merged(ws.cell(row=r + 2, column=c + 1), fmt)
+
+                wb.save(file_path)
+                self.current_file_path = file_path
+                self._structural_ops = []
 
             n = len(self._excel_sheets)
             self.statusBar().showMessage(
