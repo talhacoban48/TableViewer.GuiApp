@@ -418,11 +418,15 @@ class SortFilterHeaderView(QHeaderView):
     # Space for 3 icons (sort + filter + clear) — clear slot always reserved
     _ICON_RESERVE = _ICON_SIZE * 3 + _ICON_GAP * 4 + 16
 
+    _HEADER_HEIGHT = 36   # px
+
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
         self.setSectionsClickable(True)    # allow column selection by clicking label area
         self.setSortIndicatorShown(False)
         self.setHighlightSections(False)
+        self.setMinimumHeight(self._HEADER_HEIGHT)
+        self.setMaximumHeight(self._HEADER_HEIGHT)
 
         self._sort_px   = load_pixmap("sort.ico",   self._ICON_SIZE, self._ICON_SIZE)
         self._filter_px = load_pixmap("filter.ico", self._ICON_SIZE, self._ICON_SIZE)
@@ -640,6 +644,9 @@ class TableViewerApp(QMainWindow):
         self.table_view.setSelectionMode(QTableView.ExtendedSelection)
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_view.customContextMenuRequested.connect(self._show_context_menu)
+        self.table_view.verticalHeader().setDefaultSectionSize(22)
+        self.table_view.verticalHeader().setMinimumWidth(48)
+        self.table_view.setViewportMargins(0, 0, 10, 0)   # 10 px right margin
 
         # ── Search bar ──
         search_bar = QWidget()
@@ -1416,11 +1423,9 @@ class TableViewerApp(QMainWindow):
                              self._user_changes.get(sheet_name, {})):
                 self._remap_rows(fmt_dict, source_rows)
 
-            # Remove from model with signals blocked
-            self._source_model.blockSignals(True)
+            # Remove from model (view gets notified normally)
             for row in rows_desc:
                 self._source_model.removeRow(row)
-            self._source_model.blockSignals(False)
 
             self._update_status()
         except Exception:
@@ -1447,11 +1452,9 @@ class TableViewerApp(QMainWindow):
                              self._user_changes.get(sheet_name, {})):
                 self._remap_cols(fmt_dict, source_cols)
 
-            # Remove from model with signals blocked
-            self._source_model.blockSignals(True)
+            # Remove from model (view gets notified normally)
             for col in cols_desc:
                 self._source_model.removeColumn(col)
-            self._source_model.blockSignals(False)
 
             self._update_status()
         except Exception:
@@ -1485,14 +1488,12 @@ class TableViewerApp(QMainWindow):
                              self._user_changes.get(sheet_name, {})):
                 self._shift_rows(fmt_dict, insert_at)
 
-            # Now insert into model with signals blocked
-            self._source_model.blockSignals(True)
+            # Insert into model (view gets notified normally)
             col_count = self._source_model.columnCount()
             items = [QStandardItem("") for _ in range(col_count)]
             for it in items:
                 it.setEditable(True)
             self._source_model.insertRow(insert_at, items)
-            self._source_model.blockSignals(False)
 
             self._update_status()
         except Exception:
@@ -1524,15 +1525,18 @@ class TableViewerApp(QMainWindow):
                              self._user_changes.get(sheet_name, {})):
                 self._shift_cols(fmt_dict, insert_at)
 
-            # Now insert into model with signals blocked
-            self._source_model.blockSignals(True)
+            # Insert into model (view gets notified normally)
             self._source_model.insertColumn(insert_at)
             self._source_model.setHorizontalHeaderItem(insert_at, QStandardItem(name))
+            self._source_model.setHeaderData(
+                insert_at, Qt.Horizontal,
+                int(Qt.AlignLeft | Qt.AlignVCenter),
+                Qt.TextAlignmentRole
+            )
             for row in range(self._source_model.rowCount()):
                 item = QStandardItem("")
                 item.setEditable(True)
                 self._source_model.setItem(row, insert_at, item)
-            self._source_model.blockSignals(False)
 
             self._update_status()
         except Exception:
