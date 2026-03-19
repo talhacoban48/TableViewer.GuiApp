@@ -4,6 +4,13 @@ Excel ve CSV dosyalarını görüntülemek, düzenlemek ve kaydetmek için PyQt5
 
 ---
 
+## İndir
+
+**[TableViewer-Setup-v1.0.0.exe](https://github.com/talhacoban48/TableViewer.GuiApp/releases/download/v.1.0.0/TableViewer-Setup-v1.0.0.exe)**
+
+
+---
+
 ## Özellikler
 
 ### Dosya Desteği
