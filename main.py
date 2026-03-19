@@ -612,6 +612,7 @@ class TableViewerApp(QMainWindow):
         self._sheet_cache:  dict      = {}   # sheet_name -> DataFrame (lazy)
         self._all_sheet_formats: dict = {}   # sheet_name -> {(row,col): fmt_dict}  (for toolbar display)
         self._user_changes: dict      = {}   # sheet_name -> {(row,col): {key:val}}  (only user-applied toolbar changes)
+        self._structural_ops: list    = []   # list of (sheet_name, op, *args) replayed on save
         self._undo_stack: list        = []
         self._cell_shadow: dict       = {}   # (row,col) -> text before last edit
         self._fmt_fg_color: QColor    = QColor(Qt.black)
@@ -1280,20 +1281,28 @@ class TableViewerApp(QMainWindow):
         """Remove rows (sorted descending) from model, df, cache, and format dicts."""
         try:
             sheet_name = self._current_sheet_name()
+            rows_desc = sorted(source_rows, reverse=True)
 
-            for row in sorted(source_rows, reverse=True):
-                self._source_model.removeRow(row)
-                if self.df is not None and row < len(self.df):
-                    self.df = self.df.drop(self.df.index[row]).reset_index(drop=True)
-                if sheet_name and sheet_name in self._sheet_cache:
-                    df_c = self._sheet_cache[sheet_name]
-                    if row < len(df_c):
-                        self._sheet_cache[sheet_name] = df_c.drop(df_c.index[row]).reset_index(drop=True)
+            # Record structural op for save-time replay
+            self._structural_ops.append((sheet_name, 'delete_rows', rows_desc))
 
-            # Rebuild format/user_changes keys (row indices shifted)
+            # Update df / cache first
+            if self.df is not None:
+                self.df = self.df.drop(self.df.index[rows_desc]).reset_index(drop=True)
+            if sheet_name and sheet_name in self._sheet_cache:
+                df_c = self._sheet_cache[sheet_name]
+                self._sheet_cache[sheet_name] = df_c.drop(df_c.index[rows_desc]).reset_index(drop=True)
+
+            # Remap format keys
             for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
                              self._user_changes.get(sheet_name, {})):
                 self._remap_rows(fmt_dict, source_rows)
+
+            # Remove from model with signals blocked
+            self._source_model.blockSignals(True)
+            for row in rows_desc:
+                self._source_model.removeRow(row)
+            self._source_model.blockSignals(False)
 
             self._update_status()
         except Exception:
@@ -1303,20 +1312,28 @@ class TableViewerApp(QMainWindow):
         """Remove columns (sorted descending) from model, df, cache, and format dicts."""
         try:
             sheet_name = self._current_sheet_name()
+            cols_desc = sorted(source_cols, reverse=True)
 
-            for col in sorted(source_cols, reverse=True):
-                self._source_model.removeColumn(col)
-                if self.df is not None and col < len(self.df.columns):
-                    self.df = self.df.drop(self.df.columns[col], axis=1)
-                if sheet_name and sheet_name in self._sheet_cache:
-                    df_c = self._sheet_cache[sheet_name]
-                    if col < len(df_c.columns):
-                        self._sheet_cache[sheet_name] = df_c.drop(df_c.columns[col], axis=1)
+            # Record structural op for save-time replay
+            self._structural_ops.append((sheet_name, 'delete_cols', cols_desc))
 
-            # Rebuild format/user_changes keys (col indices shifted)
+            # Update df / cache first
+            if self.df is not None:
+                self.df = self.df.drop(self.df.columns[cols_desc], axis=1)
+            if sheet_name and sheet_name in self._sheet_cache:
+                df_c = self._sheet_cache[sheet_name]
+                self._sheet_cache[sheet_name] = df_c.drop(df_c.columns[cols_desc], axis=1)
+
+            # Remap format keys
             for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
                              self._user_changes.get(sheet_name, {})):
                 self._remap_cols(fmt_dict, source_cols)
+
+            # Remove from model with signals blocked
+            self._source_model.blockSignals(True)
+            for col in cols_desc:
+                self._source_model.removeColumn(col)
+            self._source_model.blockSignals(False)
 
             self._update_status()
         except Exception:
@@ -1325,35 +1342,39 @@ class TableViewerApp(QMainWindow):
     def _add_row(self, insert_at: int):
         """Insert a blank row at insert_at (after last selected row)."""
         try:
-            import pandas as pd
             sheet_name = self._current_sheet_name()
 
-            # Insert into model
+            # Record structural op for save-time replay
+            self._structural_ops.append((sheet_name, 'insert_row', insert_at))
+
+            # Update df / cache FIRST so _on_item_edited sees correct state
+            if self.df is not None:
+                blank = pd.DataFrame([[""] * len(self.df.columns)], columns=self.df.columns)
+                self.df = pd.concat(
+                    [self.df.iloc[:insert_at], blank, self.df.iloc[insert_at:]],
+                    ignore_index=True
+                )
+            if sheet_name and sheet_name in self._sheet_cache:
+                df_c = self._sheet_cache[sheet_name]
+                blank = pd.DataFrame([[""] * len(df_c.columns)], columns=df_c.columns)
+                self._sheet_cache[sheet_name] = pd.concat(
+                    [df_c.iloc[:insert_at], blank, df_c.iloc[insert_at:]],
+                    ignore_index=True
+                )
+
+            # Shift format keys BEFORE touching the model
+            for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
+                             self._user_changes.get(sheet_name, {})):
+                self._shift_rows(fmt_dict, insert_at)
+
+            # Now insert into model with signals blocked
+            self._source_model.blockSignals(True)
             col_count = self._source_model.columnCount()
             items = [QStandardItem("") for _ in range(col_count)]
             for it in items:
                 it.setEditable(True)
             self._source_model.insertRow(insert_at, items)
-
-            # Insert into df
-            if self.df is not None:
-                blank = pd.DataFrame([[""] * len(self.df.columns)], columns=self.df.columns)
-                top = self.df.iloc[:insert_at]
-                bot = self.df.iloc[insert_at:]
-                self.df = pd.concat([top, blank, bot], ignore_index=True)
-
-            # Insert into cache
-            if sheet_name and sheet_name in self._sheet_cache:
-                df_c = self._sheet_cache[sheet_name]
-                blank = pd.DataFrame([[""] * len(df_c.columns)], columns=df_c.columns)
-                top = df_c.iloc[:insert_at]
-                bot = df_c.iloc[insert_at:]
-                self._sheet_cache[sheet_name] = pd.concat([top, blank, bot], ignore_index=True)
-
-            # Shift format keys >= insert_at down by 1
-            for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
-                             self._user_changes.get(sheet_name, {})):
-                self._shift_rows(fmt_dict, insert_at)
+            self._source_model.blockSignals(False)
 
             self._update_status()
         except Exception:
@@ -1369,26 +1390,31 @@ class TableViewerApp(QMainWindow):
 
             sheet_name = self._current_sheet_name()
 
-            # Insert into model
+            # Record structural op for save-time replay
+            self._structural_ops.append((sheet_name, 'insert_col', insert_at))
+
+            # Update df / cache FIRST so _on_item_edited sees correct state
+            if self.df is not None:
+                self.df.insert(insert_at, name, "")
+            if sheet_name and sheet_name in self._sheet_cache:
+                df_c = self._sheet_cache[sheet_name]
+                if df_c is not self.df:
+                    df_c.insert(insert_at, name, "")
+
+            # Shift format keys BEFORE touching the model
+            for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
+                             self._user_changes.get(sheet_name, {})):
+                self._shift_cols(fmt_dict, insert_at)
+
+            # Now insert into model with signals blocked
+            self._source_model.blockSignals(True)
             self._source_model.insertColumn(insert_at)
             self._source_model.setHorizontalHeaderItem(insert_at, QStandardItem(name))
             for row in range(self._source_model.rowCount()):
                 item = QStandardItem("")
                 item.setEditable(True)
                 self._source_model.setItem(row, insert_at, item)
-
-            # Insert into df
-            if self.df is not None:
-                self.df.insert(insert_at, name, "")
-
-            # Insert into cache
-            if sheet_name and sheet_name in self._sheet_cache:
-                self._sheet_cache[sheet_name].insert(insert_at, name, "")
-
-            # Shift format keys >= insert_at right by 1
-            for fmt_dict in (self._all_sheet_formats.get(sheet_name, {}),
-                             self._user_changes.get(sheet_name, {})):
-                self._shift_cols(fmt_dict, insert_at)
+            self._source_model.blockSignals(False)
 
             self._update_status()
         except Exception:
@@ -1547,6 +1573,7 @@ class TableViewerApp(QMainWindow):
                 self._sheet_cache       = {}
                 self._all_sheet_formats = {}
                 self._user_changes      = {}
+                self._structural_ops    = []
                 df = xf.parse(sheets[0])
                 self._sheet_cache[sheets[0]] = df
                 self._setup_sheet_tabs(sheets)
@@ -1556,6 +1583,7 @@ class TableViewerApp(QMainWindow):
                 self._sheet_cache       = {}
                 self._all_sheet_formats = {}
                 self._user_changes      = {}
+                self._structural_ops    = []
                 self._setup_sheet_tabs([])
                 df = self._read_csv_with_auto_encoding(file_path)
                 self._load_dataframe(df, file_path)
@@ -1714,6 +1742,25 @@ class TableViewerApp(QMainWindow):
                 sheets = self._excel_sheets if self._excel_sheets else (
                     [wb.sheetnames[0]] if wb.sheetnames else ['Sheet1']
                 )
+
+                # Replay structural ops (insert/delete row/col) on each sheet so
+                # existing cell formatting shifts to the correct positions.
+                for sn, op, arg in self._structural_ops:
+                    target = sn if sn else (wb.sheetnames[0] if wb.sheetnames else None)
+                    if target is None or target not in wb.sheetnames:
+                        continue
+                    ws = wb[target]
+                    if op == 'insert_row':
+                        ws.insert_rows(arg + 2)          # +2: header at row 1, data starts row 2
+                    elif op == 'delete_rows':
+                        for r in arg:                    # arg is already descending
+                            ws.delete_rows(r + 2)
+                    elif op == 'insert_col':
+                        ws.insert_cols(arg + 1)          # +1: xlsx columns are 1-indexed
+                    elif op == 'delete_cols':
+                        for c in arg:                    # arg is already descending
+                            ws.delete_cols(c + 1)
+
                 for sheet_name in sheets:
                     ws = (wb[sheet_name] if sheet_name in wb.sheetnames
                           else wb.create_sheet(title=sheet_name))
@@ -1741,6 +1788,10 @@ class TableViewerApp(QMainWindow):
                         self._apply_fmt_merged(ws.cell(row=r + 2, column=c + 1), fmt)
 
                 wb.save(file_path)
+                # After a successful save the saved file becomes the new base;
+                # structural ops have been baked in, so reset them.
+                self.current_file_path = file_path
+                self._structural_ops = []
             else:
                 # CSV source: write fresh workbook via pandas
                 self.df.to_excel(file_path, index=False)
