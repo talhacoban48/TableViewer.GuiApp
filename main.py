@@ -13,9 +13,9 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import (
     QKeySequence, QStandardItemModel, QStandardItem, QIcon,
-    QPainter, QPalette, QFont, QColor, QBrush, QPixmap,
+    QPainter, QPalette, QFont, QColor, QBrush, QPixmap, QPen,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSortFilterProxyModel, QRect, QRectF, QPoint, QTimer, QSize
+from PyQt5.QtCore import Qt, pyqtSignal, QSortFilterProxyModel, QRect, QRectF, QPoint, QTimer, QSize, QEvent
 
 SUPPORTED_EXTENSIONS = ('.xlsx', '.xls', '.csv')
 CSV_ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1254', 'latin-1', 'iso-8859-9']
@@ -403,6 +403,50 @@ class FilterPopup(QFrame):
 
 
 # ---------------------------------------------------------------------------
+# Marching-ants overlay  (Excel-style copy/cut border animation)
+# ---------------------------------------------------------------------------
+
+class MarchingAntsOverlay(QWidget):
+    """Transparent widget drawn on top of the table viewport to show the
+    animated dashed border around the copied / cut region."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._rect   = QRect()
+        self._offset = 0.0
+        self.hide()
+
+    def set_rect(self, rect: QRect, offset: float):
+        self._rect   = rect
+        self._offset = offset
+        self.resize(self.parent().size())
+        self.raise_()
+        self.show()
+        self.update()
+
+    def clear_rect(self):
+        self._rect = QRect()
+        self.hide()
+
+    def paintEvent(self, _):
+        if not self._rect.isValid():
+            return
+        p = QPainter(self)
+        r = self._rect.adjusted(1, 1, -1, -1)
+        for color, off_extra in (("#000000", 0.0), ("#ffffff", 4.0)):
+            pen = QPen(QColor(color), 1.5)
+            pen.setStyle(Qt.CustomDashLine)
+            pen.setDashPattern([4.0, 4.0])
+            pen.setDashOffset(self._offset + off_extra)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(r)
+
+
+# ---------------------------------------------------------------------------
 # Custom header view – sort & filter icons, no label-click sort
 # ---------------------------------------------------------------------------
 
@@ -621,6 +665,8 @@ class TableViewerApp(QMainWindow):
         self._cell_shadow: dict       = {}   # (row,col) -> text before last edit
         self._fmt_fg_color: QColor    = QColor(Qt.black)
         self._fmt_bg_color: QColor    = QColor(Qt.white)
+        self._clipboard_region        = None  # dict: mode/rows/cols/data/fmt  (internal clipboard)
+        self._march_offset: float     = 0.0
         self._init_ui()
         self._load_blank_sheet()
 
@@ -647,6 +693,15 @@ class TableViewerApp(QMainWindow):
         self.table_view.verticalHeader().setDefaultSectionSize(22)
         self.table_view.verticalHeader().setMinimumWidth(48)
         self.table_view.setViewportMargins(0, 0, 10, 0)   # 10 px right margin
+
+        # ── Marching-ants overlay (copy/cut region indicator) ──
+        self._march_overlay = MarchingAntsOverlay(self.table_view.viewport())
+        self._march_timer = QTimer(self)
+        self._march_timer.setInterval(80)
+        self._march_timer.timeout.connect(self._march_tick)
+        self.table_view.viewport().installEventFilter(self)
+        self.table_view.horizontalScrollBar().valueChanged.connect(self._update_march_overlay)
+        self.table_view.verticalScrollBar().valueChanged.connect(self._update_march_overlay)
 
         # ── Search bar ──
         search_bar = QWidget()
@@ -761,6 +816,11 @@ class TableViewerApp(QMainWindow):
         paste_action.setShortcut(QKeySequence.Paste)
         paste_action.triggered.connect(self._paste_selection)
         self.addAction(paste_action)
+
+        escape_action = QAction("Cancel Copy/Cut", self)
+        escape_action.setShortcut(QKeySequence(Qt.Key_Escape))
+        escape_action.triggered.connect(self._cancel_copy_cut)
+        self.addAction(escape_action)
 
     # ------------------------------------------------------------------
     # Format toolbar
@@ -1071,30 +1131,22 @@ class TableViewerApp(QMainWindow):
         if item is None:
             return
 
-        self._source_model.blockSignals(True)
-        item.setText(old_text)
-        self._source_model.blockSignals(False)
+        # Update df / cache first so _on_item_edited sees the right value
+        self._set_df_cell(self.df, row, col, old_text)
+        sheet_name = self._current_sheet_name()
+        if sheet_name and sheet_name in self._sheet_cache:
+            self._set_df_cell(self._sheet_cache[sheet_name], row, col, old_text)
+
+        # Update shadow before setting text so _on_item_edited exits early
         self._cell_shadow[(row, col)] = old_text
 
-        if self.df is not None:
-            col_name = self.df.columns[col]
-            dtype = self.df[col_name].dtype
-            try:
-                if pd.api.types.is_integer_dtype(dtype):
-                    value = int(old_text) if old_text.strip() else None
-                elif pd.api.types.is_float_dtype(dtype):
-                    value = float(old_text) if old_text.strip() else None
-                else:
-                    value = old_text
-            except (ValueError, TypeError):
-                value = old_text
-            self.df.iat[row, col] = value
-            if self._excel_sheets:
-                idx = self.sheet_tab_bar.currentIndex()
-                if 0 <= idx < len(self._excel_sheets):
-                    sheet_name = self._excel_sheets[idx]
-                    if sheet_name in self._sheet_cache:
-                        self._sheet_cache[sheet_name].iat[row, col] = value
+        # Set item text — view updates normally (no blockSignals)
+        try:
+            self._source_model.itemChanged.disconnect(self._on_item_edited)
+        except TypeError:
+            pass
+        item.setText(old_text)
+        self._source_model.itemChanged.connect(self._on_item_edited)
 
     # ------------------------------------------------------------------
     # xlsx formatting I/O
@@ -1212,6 +1264,28 @@ class TableViewerApp(QMainWindow):
     def _clear_global_search(self):
         self.global_search_input.clear()   # triggers textChanged → timer → apply
 
+    def _set_df_cell(self, df, row: int, col: int, text: str):
+        """Write a string value into df at (row, col), coercing dtype safely."""
+        if df is None or row >= len(df) or col >= len(df.columns):
+            return
+        col_name = df.columns[col]
+        dtype = df[col_name].dtype
+        try:
+            if pd.api.types.is_integer_dtype(dtype):
+                value = int(text) if text.strip() else None
+            elif pd.api.types.is_float_dtype(dtype):
+                value = float(text) if text.strip() else None
+            else:
+                value = text
+        except (ValueError, TypeError):
+            value = text
+        try:
+            df.iat[row, col] = value
+        except (TypeError, ValueError):
+            # Column dtype can't hold the value — widen it to object
+            df[col_name] = df[col_name].astype(object)
+            df.iat[row, col] = value
+
     def _on_item_edited(self, item):
         """Sync a cell edit back to self.df and the sheet cache."""
         row, col = item.row(), item.column()
@@ -1229,20 +1303,7 @@ class TableViewerApp(QMainWindow):
         if self.df is None:
             return
 
-        # Try to preserve the original column dtype
-        col_name = self.df.columns[col]
-        dtype = self.df[col_name].dtype
-        try:
-            if pd.api.types.is_integer_dtype(dtype):
-                value = int(text) if text.strip() else None
-            elif pd.api.types.is_float_dtype(dtype):
-                value = float(text) if text.strip() else None
-            else:
-                value = text
-        except (ValueError, TypeError):
-            value = text
-
-        self.df.iat[row, col] = value
+        self._set_df_cell(self.df, row, col, text)
 
         # Keep the active sheet cache in sync
         if self._excel_sheets:
@@ -1250,7 +1311,7 @@ class TableViewerApp(QMainWindow):
             if 0 <= idx < len(self._excel_sheets):
                 sheet_name = self._excel_sheets[idx]
                 if sheet_name in self._sheet_cache:
-                    self._sheet_cache[sheet_name].iat[row, col] = value
+                    self._set_df_cell(self._sheet_cache[sheet_name], row, col, text)
 
     # ------------------------------------------------------------------
     # Context Menu (right-click)
@@ -1315,92 +1376,173 @@ class TableViewerApp(QMainWindow):
             self._add_column(insert_col)
 
     # ------------------------------------------------------------------
+    # Marching-ants helpers
+    # ------------------------------------------------------------------
+
+    def eventFilter(self, obj, event):
+        if obj is self.table_view.viewport() and event.type() == QEvent.Resize:
+            self._march_overlay.resize(obj.size())
+        return super().eventFilter(obj, event)
+
+    def _march_tick(self):
+        self._march_offset = (self._march_offset + 1.5) % 8.0
+        self._update_march_overlay()
+
+    def _update_march_overlay(self):
+        if self._clipboard_region is None or self._proxy_model is None:
+            self._march_overlay.clear_rect()
+            return
+        rows = self._clipboard_region['rows']
+        cols = self._clipboard_region['cols']
+        tl = self._proxy_model.mapFromSource(self._source_model.index(rows[0],  cols[0]))
+        br = self._proxy_model.mapFromSource(self._source_model.index(rows[-1], cols[-1]))
+        if not tl.isValid() or not br.isValid():
+            self._march_overlay.clear_rect()
+            return
+        rect = self.table_view.visualRect(tl).united(self.table_view.visualRect(br))
+        if rect.isValid():
+            self._march_overlay.set_rect(rect, self._march_offset)
+        else:
+            self._march_overlay.clear_rect()
+
+    def _cancel_copy_cut(self):
+        self._clipboard_region = None
+        self._march_timer.stop()
+        self._march_overlay.clear_rect()
+
+    # ------------------------------------------------------------------
     # Cut / Copy / Paste
     # ------------------------------------------------------------------
 
-    def _copy_selection(self):
-        """Copy selected cells to clipboard as tab-separated text (Excel-compatible)."""
+    def _capture_region(self, mode: str):
+        """Snapshot selected cells (values + formatting) into _clipboard_region."""
         if self._source_model is None:
-            return
+            return False
         indexes = self.table_view.selectionModel().selectedIndexes()
         if not indexes:
-            return
+            return False
         src = [self._proxy_model.mapToSource(i) for i in indexes]
         rows = sorted({i.row() for i in src})
         cols = sorted({i.column() for i in src})
-        cell_map = {(i.row(), i.column()): self._source_model.data(i, Qt.DisplayRole) or ""
-                    for i in src}
-        text = "\n".join(
-            "\t".join(cell_map.get((r, c), "") for c in cols)
-            for r in rows
+        data, fmt = [], {}
+        for dr, r in enumerate(rows):
+            row_data = []
+            for dc, c in enumerate(cols):
+                item = self._source_model.item(r, c)
+                val  = item.text() if item else ""
+                row_data.append(val)
+                if item:
+                    cell_fmt = self._fmt_from_item(item)
+                    if cell_fmt:
+                        fmt[(dr, dc)] = cell_fmt
+            data.append(row_data)
+        self._clipboard_region = {'mode': mode, 'rows': rows, 'cols': cols,
+                                  'data': data, 'fmt': fmt}
+        # Also write tab-separated text for external apps
+        QApplication.clipboard().setText(
+            "\n".join("\t".join(row) for row in data)
         )
-        QApplication.clipboard().setText(text)
+        self._march_offset = 0.0
+        self._march_timer.start()
+        self._update_march_overlay()
+        return True
+
+    def _copy_selection(self):
+        self._capture_region('copy')
 
     def _cut_selection(self):
-        """Copy selected cells then clear their content."""
-        self._copy_selection()
-        if self._source_model is None:
-            return
-        indexes = self.table_view.selectionModel().selectedIndexes()
-        if not indexes:
-            return
-        self._source_model.blockSignals(True)
-        for proxy_idx in indexes:
-            src = self._proxy_model.mapToSource(proxy_idx)
-            item = self._source_model.item(src.row(), src.column())
-            if item:
-                item.setText("")
-        self._source_model.blockSignals(False)
-        # Sync cleared values to df / cache
-        for proxy_idx in indexes:
-            src = self._proxy_model.mapToSource(proxy_idx)
-            r, c = src.row(), src.column()
-            if self.df is not None and r < len(self.df) and c < len(self.df.columns):
-                self.df.iat[r, c] = ""
-            sheet_name = self._current_sheet_name()
-            if sheet_name and sheet_name in self._sheet_cache:
-                df_c = self._sheet_cache[sheet_name]
-                if r < len(df_c) and c < len(df_c.columns):
-                    df_c.iat[r, c] = ""
+        self._capture_region('cut')
 
     def _paste_selection(self):
-        """Paste clipboard text starting at the top-left selected cell."""
         if self._source_model is None:
-            return
-        text = QApplication.clipboard().text()
-        if not text:
             return
         indexes = self.table_view.selectionModel().selectedIndexes()
         if not indexes:
             return
-        src = [self._proxy_model.mapToSource(i) for i in indexes]
-        start_row = min(i.row() for i in src)
-        start_col = min(i.column() for i in src)
-        rows_data = text.split("\n")
+        src_indices = [self._proxy_model.mapToSource(i) for i in indexes]
+        start_row = min(i.row() for i in src_indices)
+        start_col = min(i.column() for i in src_indices)
         sheet_name = self._current_sheet_name()
-        self._source_model.blockSignals(True)
-        for dr, line in enumerate(rows_data):
-            cells = line.split("\t")
-            r = start_row + dr
-            if r >= self._source_model.rowCount():
-                break
-            for dc, val in enumerate(cells):
-                c = start_col + dc
-                if c >= self._source_model.columnCount():
+
+        if self._clipboard_region is not None:
+            # ── Internal paste (preserves formatting) ──
+            region = self._clipboard_region
+            try:
+                self._source_model.itemChanged.disconnect(self._on_item_edited)
+            except TypeError:
+                pass
+            for dr, row_data in enumerate(region['data']):
+                r = start_row + dr
+                if r >= self._source_model.rowCount():
                     break
-                item = self._source_model.item(r, c)
-                if item is None:
-                    item = QStandardItem()
-                    item.setEditable(True)
-                    self._source_model.setItem(r, c, item)
-                item.setText(val)
-                if self.df is not None and r < len(self.df) and c < len(self.df.columns):
-                    self.df.iat[r, c] = val
-                if sheet_name and sheet_name in self._sheet_cache:
-                    df_c = self._sheet_cache[sheet_name]
-                    if r < len(df_c) and c < len(df_c.columns):
-                        df_c.iat[r, c] = val
-        self._source_model.blockSignals(False)
+                for dc, val in enumerate(row_data):
+                    c = start_col + dc
+                    if c >= self._source_model.columnCount():
+                        break
+                    item = self._source_model.item(r, c)
+                    if item is None:
+                        item = QStandardItem()
+                        item.setEditable(True)
+                        self._source_model.setItem(r, c, item)
+                    item.setText(val)
+                    cell_fmt = region['fmt'].get((dr, dc), {})
+                    if cell_fmt:
+                        self._apply_format_to_item(item, cell_fmt)
+                        uc = self._user_changes.setdefault(
+                            sheet_name or '__csv__', {}).setdefault((r, c), {})
+                        uc.update(cell_fmt)
+                    self._set_df_cell(self.df, r, c, val)
+                    if sheet_name and sheet_name in self._sheet_cache:
+                        self._set_df_cell(self._sheet_cache[sheet_name], r, c, val)
+            self._source_model.itemChanged.connect(self._on_item_edited)
+
+            if region['mode'] == 'cut':
+                # Clear source cells after paste
+                try:
+                    self._source_model.itemChanged.disconnect(self._on_item_edited)
+                except TypeError:
+                    pass
+                for r in region['rows']:
+                    for c in region['cols']:
+                        item = self._source_model.item(r, c)
+                        if item:
+                            item.setText("")
+                        if self.df is not None and r < len(self.df) and c < len(self.df.columns):
+                            self.df.iat[r, c] = ""
+                        if sheet_name and sheet_name in self._sheet_cache:
+                            df_c = self._sheet_cache[sheet_name]
+                            if r < len(df_c) and c < len(df_c.columns):
+                                df_c.iat[r, c] = ""
+                self._source_model.itemChanged.connect(self._on_item_edited)
+
+            self._cancel_copy_cut()
+        else:
+            # ── External paste from system clipboard ──
+            text = QApplication.clipboard().text()
+            if not text:
+                return
+            try:
+                self._source_model.itemChanged.disconnect(self._on_item_edited)
+            except TypeError:
+                pass
+            for dr, line in enumerate(text.split("\n")):
+                r = start_row + dr
+                if r >= self._source_model.rowCount():
+                    break
+                for dc, val in enumerate(line.split("\t")):
+                    c = start_col + dc
+                    if c >= self._source_model.columnCount():
+                        break
+                    item = self._source_model.item(r, c)
+                    if item is None:
+                        item = QStandardItem()
+                        item.setEditable(True)
+                        self._source_model.setItem(r, c, item)
+                    item.setText(val)
+                    self._set_df_cell(self.df, r, c, val)
+                    if sheet_name and sheet_name in self._sheet_cache:
+                        self._set_df_cell(self._sheet_cache[sheet_name], r, c, val)
+            self._source_model.itemChanged.connect(self._on_item_edited)
 
     def _delete_rows(self, source_rows: list):
         """Remove rows (sorted descending) from model, df, cache, and format dicts."""
