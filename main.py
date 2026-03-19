@@ -601,6 +601,7 @@ class TableViewerApp(QMainWindow):
         self._filter_popup     = None   # keep reference – prevents GC
         self._excel_sheets: list  = []  # sheet names for the open Excel file
         self._sheet_cache:  dict  = {}  # sheet_name -> DataFrame (lazy)
+        self._edit_mode: bool     = False
         self._init_ui()
 
     def _init_ui(self):
@@ -646,6 +647,28 @@ class TableViewerApp(QMainWindow):
 
         sb_layout.addWidget(self.global_search_input)
         sb_layout.addStretch()
+
+        self.edit_mode_btn = QPushButton(load_icon("detail.ico"), "  Edit Mode")
+        self.edit_mode_btn.setCheckable(True)
+        self.edit_mode_btn.setToolTip("Toggle edit mode – allows direct cell editing")
+        self.edit_mode_btn.setStyleSheet("""
+            QPushButton {
+                border: 1px solid #aaa;
+                border-radius: 10px;
+                padding: 3px 12px;
+                background: #e8e8e8;
+                color: #444;
+            }
+            QPushButton:hover:!checked { background: #d8d8d8; }
+            QPushButton:checked {
+                background: #0078d4;
+                border-color: #005a9e;
+                color: white;
+            }
+            QPushButton:hover:checked { background: #106ebe; }
+        """)
+        self.edit_mode_btn.toggled.connect(self._on_edit_mode_toggled)
+        sb_layout.addWidget(self.edit_mode_btn)
 
         # 500 ms debounce timer
         self._search_timer = QTimer(self)
@@ -725,6 +748,64 @@ class TableViewerApp(QMainWindow):
 
     def _clear_global_search(self):
         self.global_search_input.clear()   # triggers textChanged → timer → apply
+
+    # ------------------------------------------------------------------
+    # Edit mode
+    # ------------------------------------------------------------------
+
+    def _on_edit_mode_toggled(self, checked: bool):
+        self._edit_mode = checked
+        if self._source_model is None:
+            return
+
+        # Toggle editability of every cell
+        for row in range(self._source_model.rowCount()):
+            for col in range(self._source_model.columnCount()):
+                item = self._source_model.item(row, col)
+                if item:
+                    item.setEditable(checked)
+
+        if checked:
+            self._source_model.itemChanged.connect(self._on_item_edited)
+            self.table_view.setEditTriggers(
+                QTableView.DoubleClicked | QTableView.AnyKeyPressed
+            )
+        else:
+            try:
+                self._source_model.itemChanged.disconnect(self._on_item_edited)
+            except TypeError:
+                pass
+            self.table_view.setEditTriggers(QTableView.NoEditTriggers)
+
+    def _on_item_edited(self, item):
+        """Sync a cell edit back to self.df and the sheet cache."""
+        row, col = item.row(), item.column()
+        text = item.text()
+        if self.df is None:
+            return
+
+        # Try to preserve the original column dtype
+        col_name = self.df.columns[col]
+        dtype = self.df[col_name].dtype
+        try:
+            if pd.api.types.is_integer_dtype(dtype):
+                value = int(text) if text.strip() else None
+            elif pd.api.types.is_float_dtype(dtype):
+                value = float(text) if text.strip() else None
+            else:
+                value = text
+        except (ValueError, TypeError):
+            value = text
+
+        self.df.iat[row, col] = value
+
+        # Keep the active sheet cache in sync
+        if self._excel_sheets:
+            idx = self.sheet_tab_bar.currentIndex()
+            if 0 <= idx < len(self._excel_sheets):
+                sheet_name = self._excel_sheets[idx]
+                if sheet_name in self._sheet_cache:
+                    self._sheet_cache[sheet_name].iat[row, col] = value
 
     # ------------------------------------------------------------------
     # Sort / Filter
@@ -882,6 +963,13 @@ class TableViewerApp(QMainWindow):
         self._ensure_header_column_widths()   # make room for icons
 
         self._header.reset_state()
+
+        # Reset edit mode
+        self._edit_mode = False
+        self.edit_mode_btn.blockSignals(True)
+        self.edit_mode_btn.setChecked(False)
+        self.edit_mode_btn.blockSignals(False)
+        self.table_view.setEditTriggers(QTableView.NoEditTriggers)
 
         # Reset global search
         self._search_timer.stop()
