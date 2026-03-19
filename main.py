@@ -2,19 +2,28 @@ from __future__ import annotations
 
 import sys
 import os
+import traceback
 import pandas as pd
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTableView, QFileDialog, QAction,
     QStatusBar, QLabel, QMessageBox, QHeaderView, QFrame, QVBoxLayout,
     QHBoxLayout, QLineEdit, QCheckBox, QListWidget, QListWidgetItem,
     QPushButton, QTabWidget, QWidget, QComboBox, QTabBar,
+    QColorDialog, QSpinBox,
 )
-from PyQt5.QtGui import QKeySequence, QStandardItemModel, QStandardItem, QIcon, QPainter, QPalette
-from PyQt5.QtCore import Qt, pyqtSignal, QSortFilterProxyModel, QRect, QRectF, QPoint, QTimer
+from PyQt5.QtGui import (
+    QKeySequence, QStandardItemModel, QStandardItem, QIcon,
+    QPainter, QPalette, QFont, QColor, QBrush, QPixmap,
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QSortFilterProxyModel, QRect, QRectF, QPoint, QTimer, QSize
 
 SUPPORTED_EXTENSIONS = ('.xlsx', '.xls', '.csv')
 CSV_ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1254', 'latin-1', 'iso-8859-9']
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+# Custom item data role: stores a frozenset of property names explicitly set on a cell
+# (e.g. {'bold', 'size', 'fg'}).  Used by _fmt_from_item to avoid inheriting app defaults.
+_FMT_KEYS_ROLE = Qt.UserRole + 100
 
 # Operators shown in the "Number Filter" tab
 NUMBER_OPS = ['=', '≠', '>', '>=', '<', '<=', 'between']
@@ -411,7 +420,7 @@ class SortFilterHeaderView(QHeaderView):
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
-        self.setSectionsClickable(False)   # no label-click sort
+        self.setSectionsClickable(True)    # allow column selection by clicking label area
         self.setSortIndicatorShown(False)
         self.setHighlightSections(False)
 
@@ -599,9 +608,14 @@ class TableViewerApp(QMainWindow):
         self._source_model     = None
         self._proxy_model      = None
         self._filter_popup     = None   # keep reference – prevents GC
-        self._excel_sheets: list  = []  # sheet names for the open Excel file
-        self._sheet_cache:  dict  = {}  # sheet_name -> DataFrame (lazy)
-        self._edit_mode: bool     = False
+        self._excel_sheets: list      = []   # sheet names for the open Excel file
+        self._sheet_cache:  dict      = {}   # sheet_name -> DataFrame (lazy)
+        self._all_sheet_formats: dict = {}   # sheet_name -> {(row,col): fmt_dict}  (for toolbar display)
+        self._user_changes: dict      = {}   # sheet_name -> {(row,col): {key:val}}  (only user-applied toolbar changes)
+        self._undo_stack: list        = []
+        self._cell_shadow: dict       = {}   # (row,col) -> text before last edit
+        self._fmt_fg_color: QColor    = QColor(Qt.black)
+        self._fmt_bg_color: QColor    = QColor(Qt.white)
         self._init_ui()
 
     def _init_ui(self):
@@ -620,55 +634,38 @@ class TableViewerApp(QMainWindow):
         self.table_view.horizontalHeader().setSectionsMovable(True)
         self.table_view.setSortingEnabled(False)
         self.table_view.setAlternatingRowColors(True)
-        self.table_view.setSelectionBehavior(QTableView.SelectRows)
+        self.table_view.setSelectionBehavior(QTableView.SelectItems)
+        self.table_view.setSelectionMode(QTableView.ExtendedSelection)
 
         # ── Search bar ──
         search_bar = QWidget()
         search_bar.setContentsMargins(0, 0, 0, 0)
         sb_layout = QHBoxLayout(search_bar)
-        sb_layout.setContentsMargins(6, 4, 6, 4)
-        sb_layout.setSpacing(4)
+        sb_layout.setContentsMargins(8, 7, 8, 7)
+        sb_layout.setSpacing(6)
 
         search_icon_lbl = QLabel()
         search_icon_lbl.setPixmap(load_pixmap("search.ico"))
         sb_layout.addWidget(search_icon_lbl)
 
+        # Cancel button: outside the input, to its left, hidden until there is text
+        self.search_clear_btn = QPushButton()
+        self.search_clear_btn.setIcon(load_icon("cancel.ico"))
+        self.search_clear_btn.setIconSize(QSize(14, 14))
+        self.search_clear_btn.setFixedSize(22, 22)
+        self.search_clear_btn.setFlat(True)
+        self.search_clear_btn.setVisible(False)
+        self.search_clear_btn.setToolTip("Clear search")
+        self.search_clear_btn.clicked.connect(self._clear_global_search)
+        sb_layout.addWidget(self.search_clear_btn)
+
         self.global_search_input = QLineEdit()
         self.global_search_input.setPlaceholderText("Search in all columns…")
         self.global_search_input.setMaximumWidth(300)
         self.global_search_input.textChanged.connect(self._on_global_search_text_changed)
-
-        # Clear button embedded inside the input field (trailing position)
-        self.search_clear_action = self.global_search_input.addAction(
-            load_icon("cancel.ico"), QLineEdit.TrailingPosition
-        )
-        self.search_clear_action.setVisible(False)
-        self.search_clear_action.triggered.connect(self._clear_global_search)
-
         sb_layout.addWidget(self.global_search_input)
-        sb_layout.addStretch()
 
-        self.edit_mode_btn = QPushButton(load_icon("detail.ico"), "  Edit Mode")
-        self.edit_mode_btn.setCheckable(True)
-        self.edit_mode_btn.setToolTip("Toggle edit mode – allows direct cell editing")
-        self.edit_mode_btn.setStyleSheet("""
-            QPushButton {
-                border: 1px solid #aaa;
-                border-radius: 10px;
-                padding: 3px 12px;
-                background: #e8e8e8;
-                color: #444;
-            }
-            QPushButton:hover:!checked { background: #d8d8d8; }
-            QPushButton:checked {
-                background: #0078d4;
-                border-color: #005a9e;
-                color: white;
-            }
-            QPushButton:hover:checked { background: #106ebe; }
-        """)
-        self.edit_mode_btn.toggled.connect(self._on_edit_mode_toggled)
-        sb_layout.addWidget(self.edit_mode_btn)
+        sb_layout.addStretch()
 
         # 500 ms debounce timer
         self._search_timer = QTimer(self)
@@ -682,12 +679,15 @@ class TableViewerApp(QMainWindow):
         self.sheet_tab_bar.setVisible(False)
         self.sheet_tab_bar.currentChanged.connect(self._on_sheet_tab_changed)
 
-        # Central widget: search bar → table → sheet tabs
+        # Central widget: search bar → format toolbar → table → sheet tabs
+        self._format_toolbar = self._build_format_toolbar()
+
         container = QWidget()
         c_layout = QVBoxLayout(container)
         c_layout.setContentsMargins(0, 0, 0, 0)
         c_layout.setSpacing(0)
         c_layout.addWidget(search_bar)
+        c_layout.addWidget(self._format_toolbar)
         c_layout.addWidget(self.table_view)
         c_layout.addWidget(self.sheet_tab_bar)
         self.setCentralWidget(container)
@@ -729,6 +729,442 @@ class TableViewerApp(QMainWindow):
         reg_action.triggered.connect(self.register_file_associations)
         tools_menu.addAction(reg_action)
 
+        # Ctrl+Z undo (global shortcut)
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.Undo)
+        undo_action.triggered.connect(self._undo)
+        self.addAction(undo_action)
+
+    # ------------------------------------------------------------------
+    # Format toolbar
+    # ------------------------------------------------------------------
+
+    def _build_format_toolbar(self) -> QWidget:
+        bar = QWidget()
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setMaximumHeight(38)
+
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(6, 3, 6, 3)
+        layout.setSpacing(4)
+
+        # Bold button
+        self.fmt_bold_btn = QPushButton("B")
+        self.fmt_bold_btn.setCheckable(True)
+        self.fmt_bold_btn.setFixedSize(26, 26)
+        self.fmt_bold_btn.setToolTip("Bold")
+        bold_font = QFont(self.fmt_bold_btn.font())
+        bold_font.setBold(True)
+        self.fmt_bold_btn.setFont(bold_font)
+        self.fmt_bold_btn.setStyleSheet(
+            "QPushButton{border:1px solid #aaa;border-radius:3px;}"
+            "QPushButton:checked{background:#0078d4;color:white;border-color:#005a9e;}"
+            "QPushButton:hover:!checked{background:#e0e0e0;}"
+        )
+        self.fmt_bold_btn.toggled.connect(
+            lambda checked: self._apply_format_to_selection('bold', checked)
+        )
+        layout.addWidget(self.fmt_bold_btn)
+
+        # Italic button
+        self.fmt_italic_btn = QPushButton("I")
+        self.fmt_italic_btn.setCheckable(True)
+        self.fmt_italic_btn.setFixedSize(26, 26)
+        self.fmt_italic_btn.setToolTip("Italic")
+        italic_font = QFont(self.fmt_italic_btn.font())
+        italic_font.setItalic(True)
+        self.fmt_italic_btn.setFont(italic_font)
+        self.fmt_italic_btn.setStyleSheet(
+            "QPushButton{border:1px solid #aaa;border-radius:3px;}"
+            "QPushButton:checked{background:#0078d4;color:white;border-color:#005a9e;}"
+            "QPushButton:hover:!checked{background:#e0e0e0;}"
+        )
+        self.fmt_italic_btn.toggled.connect(
+            lambda checked: self._apply_format_to_selection('italic', checked)
+        )
+        layout.addWidget(self.fmt_italic_btn)
+
+        # Font size spinbox
+        layout.addWidget(QLabel("Size:"))
+        self.fmt_size_spin = QSpinBox()
+        self.fmt_size_spin.setRange(6, 72)
+        self.fmt_size_spin.setValue(10)
+        self.fmt_size_spin.setFixedWidth(55)
+        self.fmt_size_spin.setToolTip("Font size (pt)")
+        self.fmt_size_spin.valueChanged.connect(
+            lambda v: self._apply_format_to_selection('size', v)
+        )
+        layout.addWidget(self.fmt_size_spin)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
+
+        # Text color button
+        self.fmt_fg_btn = QPushButton()
+        self.fmt_fg_btn.setFixedSize(28, 26)
+        self.fmt_fg_btn.setToolTip("Text Color")
+        self.fmt_fg_btn.clicked.connect(self._pick_fg_color)
+        layout.addWidget(self.fmt_fg_btn)
+
+        # Background color button
+        self.fmt_bg_btn = QPushButton()
+        self.fmt_bg_btn.setFixedSize(28, 26)
+        self.fmt_bg_btn.setToolTip("Cell Background Color")
+        self.fmt_bg_btn.clicked.connect(self._pick_bg_color)
+        layout.addWidget(self.fmt_bg_btn)
+
+        layout.addStretch()
+        self._update_fmt_button_icons()
+        return bar
+
+    def _make_color_icon(self, label: str, color: QColor) -> QIcon:
+        """Draw a small icon with a letter and a colored bar underneath."""
+        px = QPixmap(18, 18)
+        px.fill(Qt.transparent)
+        p = QPainter(px)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(8)
+        p.setFont(font)
+        p.setPen(Qt.black)
+        p.drawText(QRect(0, 0, 18, 13), Qt.AlignCenter, label)
+        p.fillRect(QRect(1, 14, 16, 3), color)
+        p.end()
+        return QIcon(px)
+
+    def _update_fmt_button_icons(self):
+        self.fmt_fg_btn.setIcon(self._make_color_icon("A", self._fmt_fg_color))
+        self.fmt_fg_btn.setIconSize(QSize(18, 18))
+
+        px = QPixmap(18, 18)
+        px.fill(self._fmt_bg_color)
+        p = QPainter(px)
+        p.setPen(QColor("#888888"))
+        p.drawRect(0, 0, 17, 17)
+        p.end()
+        self.fmt_bg_btn.setIcon(QIcon(px))
+        self.fmt_bg_btn.setIconSize(QSize(18, 18))
+
+    def _pick_fg_color(self):
+        color = QColorDialog.getColor(self._fmt_fg_color, self, "Text Color")
+        if color.isValid():
+            self._fmt_fg_color = color
+            self._update_fmt_button_icons()
+            self._apply_format_to_selection('fg', color.name())
+
+    def _pick_bg_color(self):
+        color = QColorDialog.getColor(self._fmt_bg_color, self, "Background Color")
+        if color.isValid():
+            self._fmt_bg_color = color
+            self._update_fmt_button_icons()
+            self._apply_format_to_selection('bg', color.name())
+
+    def _apply_format_to_selection(self, key: str, value):
+        """Apply a single formatting property to all currently selected cells."""
+        if self._source_model is None:
+            return
+        sel_model = self.table_view.selectionModel()
+        if sel_model is None:
+            return
+        proxy_indices = sel_model.selectedIndexes()
+        if not proxy_indices:
+            return
+
+        sheet_name = self._current_sheet_name() or '__csv__'
+        sheet_fmt = self._all_sheet_formats.setdefault(sheet_name, {})
+
+        # Disconnect itemChanged while we change formatting data (not text)
+        try:
+            self._source_model.itemChanged.disconnect(self._on_item_edited)
+        except TypeError:
+            pass
+
+        for proxy_idx in proxy_indices:
+            src_idx = self._proxy_model.mapToSource(proxy_idx)
+            row, col = src_idx.row(), src_idx.column()
+            item = self._source_model.item(row, col)
+            if item is None:
+                continue
+            fmt = sheet_fmt.setdefault((row, col), {})
+            explicit: set = set(item.data(_FMT_KEYS_ROLE) or set())
+            if key == 'bold':
+                font = item.font()
+                font.setBold(value)
+                item.setFont(font)
+                fmt['bold'] = value
+                explicit.add('bold')
+            elif key == 'italic':
+                font = item.font()
+                font.setItalic(value)
+                item.setFont(font)
+                fmt['italic'] = value
+                explicit.add('italic')
+            elif key == 'size':
+                font = item.font()
+                font.setPointSize(value)
+                item.setFont(font)
+                fmt['size'] = value
+                explicit.add('size')
+            elif key == 'fg':
+                item.setForeground(QBrush(QColor(value)))
+                fmt['fg'] = value
+                explicit.add('fg')
+            elif key == 'bg':
+                item.setBackground(QBrush(QColor(value)))
+                fmt['bg'] = value
+                explicit.add('bg')
+            item.setData(explicit, _FMT_KEYS_ROLE)
+
+            # Also record in _user_changes (only user toolbar actions go here)
+            user_cell = self._user_changes.setdefault(sheet_name, {}).setdefault((row, col), {})
+            user_cell[key] = value
+
+        self._source_model.itemChanged.connect(self._on_item_edited)
+
+    def _apply_format_to_item(self, item: QStandardItem, fmt: dict):
+        """Apply a stored format dict to a QStandardItem and record which keys
+        were explicitly set (via _FMT_KEYS_ROLE) so _fmt_from_item can be precise."""
+        explicit: set = set(item.data(_FMT_KEYS_ROLE) or set())
+        if 'bold' in fmt or 'italic' in fmt or 'size' in fmt:
+            font = item.font()
+            if 'bold' in fmt:
+                font.setBold(fmt['bold'])
+                explicit.add('bold')
+            if 'italic' in fmt:
+                font.setItalic(fmt['italic'])
+                explicit.add('italic')
+            if 'size' in fmt:
+                font.setPointSizeF(float(fmt['size']))
+                explicit.add('size')
+            item.setFont(font)
+        if 'fg' in fmt:
+            item.setForeground(QBrush(QColor(fmt['fg'])))
+            explicit.add('fg')
+        if 'bg' in fmt:
+            item.setBackground(QBrush(QColor(fmt['bg'])))
+            explicit.add('bg')
+        item.setData(explicit, _FMT_KEYS_ROLE)
+
+    def _fmt_from_item(self, item: QStandardItem) -> dict:
+        """Read only the formatting properties that were explicitly set on this item
+        (tracked via _FMT_KEYS_ROLE).  Inherited/default app font size is never saved."""
+        d = {}
+        explicit = item.data(_FMT_KEYS_ROLE)
+        if not explicit:
+            return d
+        if 'bold' in explicit or 'italic' in explicit or 'size' in explicit:
+            font = item.font()
+            if 'bold' in explicit:
+                d['bold'] = font.bold()
+            if 'italic' in explicit:
+                d['italic'] = font.italic()
+            if 'size' in explicit and font.pointSize() > 0:
+                d['size'] = font.pointSize()
+        if 'fg' in explicit:
+            fg = item.data(Qt.ForegroundRole)
+            if fg is not None:
+                c = fg.color() if isinstance(fg, QBrush) else QColor(fg)
+                if c.isValid():
+                    d['fg'] = c.name()
+        if 'bg' in explicit:
+            bg = item.data(Qt.BackgroundRole)
+            if bg is not None:
+                c = bg.color() if isinstance(bg, QBrush) else QColor(bg)
+                if c.isValid() and c.alpha() > 0:
+                    d['bg'] = c.name()
+        return d
+
+    def _sync_sheet_fmt_from_model(self):
+        """Rebuild _all_sheet_formats for the current sheet by reading
+        QStandardItem data roles directly (only stores explicitly-set properties)."""
+        if self._source_model is None:
+            return
+        sheet_name = self._current_sheet_name() or '__csv__'
+        sheet_fmt: dict = {}
+        for row in range(self._source_model.rowCount()):
+            for col in range(self._source_model.columnCount()):
+                item = self._source_model.item(row, col)
+                if item:
+                    fmt = self._fmt_from_item(item)
+                    if fmt:
+                        sheet_fmt[(row, col)] = fmt
+        self._all_sheet_formats[sheet_name] = sheet_fmt
+
+    def _on_current_cell_changed(self, current, _previous):
+        """Update the format toolbar to reflect the selected cell's formatting."""
+        if not current.isValid() or self._source_model is None:
+            return
+        src_idx = self._proxy_model.mapToSource(current)
+        row, col = src_idx.row(), src_idx.column()
+
+        sheet_name = self._current_sheet_name() or '__csv__'
+        fmt = self._all_sheet_formats.get(sheet_name, {}).get((row, col), {})
+
+        self.fmt_bold_btn.blockSignals(True)
+        self.fmt_bold_btn.setChecked(fmt.get('bold', False))
+        self.fmt_bold_btn.blockSignals(False)
+
+        self.fmt_italic_btn.blockSignals(True)
+        self.fmt_italic_btn.setChecked(fmt.get('italic', False))
+        self.fmt_italic_btn.blockSignals(False)
+
+        self.fmt_size_spin.blockSignals(True)
+        item = self._source_model.item(row, col)
+        if item:
+            size = item.font().pointSize()
+            if size <= 0:
+                size = QApplication.font().pointSize()
+            if size > 0:
+                self.fmt_size_spin.setValue(size)
+        self.fmt_size_spin.blockSignals(False)
+
+        self._fmt_fg_color = QColor(fmt['fg']) if 'fg' in fmt else QColor(Qt.black)
+        self._fmt_bg_color = QColor(fmt['bg']) if 'bg' in fmt else QColor(Qt.white)
+        self._update_fmt_button_icons()
+
+    def _current_sheet_name(self) -> str:
+        if self._excel_sheets:
+            idx = self.sheet_tab_bar.currentIndex()
+            if 0 <= idx < len(self._excel_sheets):
+                return self._excel_sheets[idx]
+        return ''
+
+    # ------------------------------------------------------------------
+    # Undo
+    # ------------------------------------------------------------------
+
+    def _undo(self):
+        if not self._undo_stack or self._source_model is None:
+            return
+        row, col, old_text = self._undo_stack.pop()
+        item = self._source_model.item(row, col)
+        if item is None:
+            return
+
+        self._source_model.blockSignals(True)
+        item.setText(old_text)
+        self._source_model.blockSignals(False)
+        self._cell_shadow[(row, col)] = old_text
+
+        if self.df is not None:
+            col_name = self.df.columns[col]
+            dtype = self.df[col_name].dtype
+            try:
+                if pd.api.types.is_integer_dtype(dtype):
+                    value = int(old_text) if old_text.strip() else None
+                elif pd.api.types.is_float_dtype(dtype):
+                    value = float(old_text) if old_text.strip() else None
+                else:
+                    value = old_text
+            except (ValueError, TypeError):
+                value = old_text
+            self.df.iat[row, col] = value
+            if self._excel_sheets:
+                idx = self.sheet_tab_bar.currentIndex()
+                if 0 <= idx < len(self._excel_sheets):
+                    sheet_name = self._excel_sheets[idx]
+                    if sheet_name in self._sheet_cache:
+                        self._sheet_cache[sheet_name].iat[row, col] = value
+
+    # ------------------------------------------------------------------
+    # xlsx formatting I/O
+    # ------------------------------------------------------------------
+
+    def _read_xlsx_formatting(self, file_path: str, sheet_name: str) -> dict:
+        """Read cell formatting from an xlsx file via openpyxl.
+        Returns {(row, col): fmt_dict} where row/col are 0-based data rows (header excluded)."""
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+            if sheet_name not in wb.sheetnames:
+                return {}
+            ws = wb[sheet_name]
+            fmt = {}
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2)):   # row 1 = header
+                for col_idx, cell in enumerate(row):
+                    d = {}
+                    f = cell.font
+                    if f:
+                        if f.bold:
+                            d['bold'] = True
+                        if f.italic:
+                            d['italic'] = True
+                        if f.size:
+                            d['size'] = float(f.size)
+                        if f.color and f.color.type == 'rgb':
+                            rgb = f.color.rgb   # 8-char ARGB
+                            if rgb and rgb.upper() not in ('00000000', 'FF000000'):
+                                d['fg'] = '#' + rgb[2:]
+                    fill = cell.fill
+                    if fill and fill.fill_type == 'solid':
+                        fc = fill.fgColor
+                        if fc and fc.type == 'rgb':
+                            rgb = fc.rgb
+                            if rgb and rgb.upper() not in ('00000000', 'FFFFFFFF'):
+                                d['bg'] = '#' + rgb[2:]
+                    if d:
+                        fmt[(row_idx, col_idx)] = d
+            return fmt
+        except Exception:
+            traceback.print_exc()
+            return {}
+
+    def _apply_openpyxl_fmt(self, cell, fmt: dict):
+        """Apply a fmt_dict to an openpyxl cell object."""
+        from openpyxl.styles import Font, PatternFill
+        if any(k in fmt for k in ('bold', 'italic', 'size', 'fg')):
+            kw = {}
+            if 'bold' in fmt:
+                kw['bold'] = fmt['bold']
+            if 'italic' in fmt:
+                kw['italic'] = fmt['italic']
+            if 'size' in fmt:
+                kw['size'] = fmt['size']
+            if 'fg' in fmt:
+                kw['color'] = 'FF' + fmt['fg'][1:]
+            cell.font = Font(**kw)
+        if 'bg' in fmt:
+            cell.fill = PatternFill(fill_type='solid', fgColor='FF' + fmt['bg'][1:])
+
+    def _save_xlsx_with_formatting(self, file_path: str):
+        """Write data + cell formatting to xlsx using openpyxl directly."""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+
+        # Use actual sheet names for xlsx; fall back to single unnamed sheet for CSV
+        sheets_to_write = self._excel_sheets if self._excel_sheets else ['']
+        for sheet_name in sheets_to_write:
+            if sheet_name:
+                df = self._sheet_cache.get(sheet_name)
+                if df is None:
+                    df = pd.read_excel(self.current_file_path, sheet_name=sheet_name)
+                    self._sheet_cache[sheet_name] = df
+                sheet_fmt = self._all_sheet_formats.get(sheet_name, {})
+                ws = wb.create_sheet(title=sheet_name)
+            else:
+                df = self.df
+                sheet_fmt = self._all_sheet_formats.get('__csv__', {})
+                ws = wb.create_sheet(title='Sheet1')
+
+            # Header row
+            for col_idx, col_name in enumerate(df.columns, 1):
+                ws.cell(row=1, column=col_idx, value=str(col_name))
+
+            # Data rows
+            for row_idx, (_, row_data) in enumerate(df.iterrows(), 2):
+                for col_idx, value in enumerate(row_data):
+                    cell_val = None if pd.isna(value) else value
+                    cell = ws.cell(row=row_idx, column=col_idx + 1, value=cell_val)
+                    fmt = sheet_fmt.get((row_idx - 2, col_idx), {})
+                    if fmt:
+                        self._apply_openpyxl_fmt(cell, fmt)
+
+        wb.save(file_path)
+
     # ------------------------------------------------------------------
     # Sort / Filter
     # ------------------------------------------------------------------
@@ -738,7 +1174,7 @@ class TableViewerApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_global_search_text_changed(self, text: str):
-        self.search_clear_action.setVisible(bool(text))
+        self.search_clear_btn.setVisible(bool(text))
         self._search_timer.start()   # restart 500 ms countdown
 
     def _apply_global_search(self):
@@ -749,38 +1185,20 @@ class TableViewerApp(QMainWindow):
     def _clear_global_search(self):
         self.global_search_input.clear()   # triggers textChanged → timer → apply
 
-    # ------------------------------------------------------------------
-    # Edit mode
-    # ------------------------------------------------------------------
-
-    def _on_edit_mode_toggled(self, checked: bool):
-        self._edit_mode = checked
-        if self._source_model is None:
-            return
-
-        # Toggle editability of every cell
-        for row in range(self._source_model.rowCount()):
-            for col in range(self._source_model.columnCount()):
-                item = self._source_model.item(row, col)
-                if item:
-                    item.setEditable(checked)
-
-        if checked:
-            self._source_model.itemChanged.connect(self._on_item_edited)
-            self.table_view.setEditTriggers(
-                QTableView.DoubleClicked | QTableView.AnyKeyPressed
-            )
-        else:
-            try:
-                self._source_model.itemChanged.disconnect(self._on_item_edited)
-            except TypeError:
-                pass
-            self.table_view.setEditTriggers(QTableView.NoEditTriggers)
-
     def _on_item_edited(self, item):
         """Sync a cell edit back to self.df and the sheet cache."""
         row, col = item.row(), item.column()
         text = item.text()
+
+        # Early exit if only formatting changed (not text content)
+        old_text = self._cell_shadow.get((row, col), "")
+        if old_text == text:
+            return
+
+        # Push to undo stack
+        self._undo_stack.append((row, col, old_text))
+        self._cell_shadow[(row, col)] = text
+
         if self.df is None:
             return
 
@@ -863,12 +1281,14 @@ class TableViewerApp(QMainWindow):
     def _on_sheet_tab_changed(self, index: int):
         if not self._excel_sheets or index < 0:
             return
+        self._sync_sheet_fmt_from_model()   # save current sheet's formatting before switching
         sheet_name = self._excel_sheets[index]
         if sheet_name not in self._sheet_cache:
             try:
                 df = pd.read_excel(self.current_file_path, sheet_name=sheet_name)
                 self._sheet_cache[sheet_name] = df
             except Exception as e:
+                traceback.print_exc()
                 QMessageBox.critical(self, "Error", f"Could not load sheet '{sheet_name}':\n{e}")
                 return
         self._load_dataframe(self._sheet_cache[sheet_name],
@@ -900,15 +1320,19 @@ class TableViewerApp(QMainWindow):
             if ext in ('.xlsx', '.xls'):
                 xf = pd.ExcelFile(file_path)
                 sheets = xf.sheet_names
-                self._excel_sheets = sheets
-                self._sheet_cache  = {}
+                self._excel_sheets      = sheets
+                self._sheet_cache       = {}
+                self._all_sheet_formats = {}
+                self._user_changes      = {}
                 df = xf.parse(sheets[0])
                 self._sheet_cache[sheets[0]] = df
                 self._setup_sheet_tabs(sheets)
                 self._load_dataframe(df, file_path, sheet_name=sheets[0])
             elif ext == '.csv':
-                self._excel_sheets = []
-                self._sheet_cache  = {}
+                self._excel_sheets      = []
+                self._sheet_cache       = {}
+                self._all_sheet_formats = {}
+                self._user_changes      = {}
                 self._setup_sheet_tabs([])
                 df = self._read_csv_with_auto_encoding(file_path)
                 self._load_dataframe(df, file_path)
@@ -919,6 +1343,7 @@ class TableViewerApp(QMainWindow):
                 )
                 return
         except Exception as e:
+            traceback.print_exc()
             QMessageBox.critical(
                 self, "Error Opening File",
                 f"Could not open file:\n{file_path}\n\n{e}"
@@ -951,7 +1376,7 @@ class TableViewerApp(QMainWindow):
             for col_idx, value in enumerate(row_data):
                 display = "" if pd.isna(value) else str(value)
                 item = QStandardItem(display)
-                item.setEditable(False)
+                item.setEditable(True)
                 source.setItem(row_idx, col_idx, item)
 
         self._source_model = source
@@ -959,24 +1384,49 @@ class TableViewerApp(QMainWindow):
         self._proxy_model.setSourceModel(source)
 
         self.table_view.setModel(self._proxy_model)
+
+        # Connect selection signal for format toolbar sync
+        self.table_view.selectionModel().currentChanged.connect(self._on_current_cell_changed)
+
         self.table_view.resizeColumnsToContents()
         self._ensure_header_column_widths()   # make room for icons
 
         self._header.reset_state()
 
-        # Reset edit mode
-        self._edit_mode = False
-        self.edit_mode_btn.blockSignals(True)
-        self.edit_mode_btn.setChecked(False)
-        self.edit_mode_btn.blockSignals(False)
-        self.table_view.setEditTriggers(QTableView.NoEditTriggers)
+        # Initialize undo tracking with a snapshot of all cell values
+        self._undo_stack = []
+        self._cell_shadow = {}
+        for r in range(self._source_model.rowCount()):
+            for c in range(self._source_model.columnCount()):
+                itm = self._source_model.item(r, c)
+                if itm:
+                    self._cell_shadow[(r, c)] = itm.text()
+
+        # Always enable editing and wire up change tracking
+        self.table_view.setEditTriggers(
+            QTableView.DoubleClicked | QTableView.AnyKeyPressed
+        )
+        self._source_model.itemChanged.connect(self._on_item_edited)
+
+        # Read and apply cell formatting for xlsx files
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ('.xlsx', '.xls') and sheet_name:
+            sheet_fmt = self._all_sheet_formats.setdefault(sheet_name, {})
+            if not sheet_fmt:
+                raw = self._read_xlsx_formatting(file_path, sheet_name)
+                sheet_fmt.update(raw)
+            for (r, c), fmt in list(sheet_fmt.items()):
+                if r < self._source_model.rowCount() and c < self._source_model.columnCount():
+                    item = self._source_model.item(r, c)
+                    if item and fmt:
+                        self._apply_format_to_item(item, fmt)
 
         # Reset global search
         self._search_timer.stop()
         self.global_search_input.blockSignals(True)
         self.global_search_input.clear()
         self.global_search_input.blockSignals(False)
-        self.search_clear_action.setVisible(False)
+        self.search_clear_btn.setVisible(False)
 
         file_name = os.path.basename(file_path)
         title = f"Table Viewer — {file_name}"
@@ -1031,25 +1481,76 @@ class TableViewerApp(QMainWindow):
         if not file_path:
             return
         try:
-            if len(self._excel_sheets) > 1:
-                # Load any sheets not yet cached, then write all
-                with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-                    for sheet_name in self._excel_sheets:
-                        if sheet_name not in self._sheet_cache:
-                            self._sheet_cache[sheet_name] = pd.read_excel(
-                                self.current_file_path, sheet_name=sheet_name
-                            )
-                        self._sheet_cache[sheet_name].to_excel(
-                            writer, sheet_name=sheet_name, index=False
-                        )
-                self.statusBar().showMessage(
-                    f"Saved {len(self._excel_sheets)} sheets successfully.", 3000
+            import openpyxl
+            src_ext = os.path.splitext(self.current_file_path or '')[1].lower()
+
+            if src_ext in ('.xlsx', '.xls') and self.current_file_path:
+                # Load original workbook as the base so workbook-level styles
+                # (default font, themes, named styles) are fully preserved.
+                wb = openpyxl.load_workbook(self.current_file_path)
+                sheets = self._excel_sheets if self._excel_sheets else (
+                    [wb.sheetnames[0]] if wb.sheetnames else ['Sheet1']
                 )
+                for sheet_name in sheets:
+                    ws = (wb[sheet_name] if sheet_name in wb.sheetnames
+                          else wb.create_sheet(title=sheet_name))
+                    df = self._sheet_cache.get(sheet_name) if sheet_name else self.df
+                    if df is None:
+                        df = self.df
+                    if df is None:
+                        continue
+
+                    # Overwrite cell values (header + data)
+                    for ci, col_name in enumerate(df.columns, 1):
+                        ws.cell(row=1, column=ci).value = str(col_name)
+                    for ri, (_, row_data) in enumerate(df.iterrows(), 2):
+                        for ci, val in enumerate(row_data):
+                            ws.cell(row=ri, column=ci + 1).value = (
+                                None if pd.isna(val) else val
+                            )
+
+                    # Apply only the formatting changes the user made in the toolbar.
+                    # We MERGE these onto the existing cell font so all original
+                    # properties (font-family, underline, workbook-default size …)
+                    # are preserved for everything the user didn't touch.
+                    user_fmt = self._user_changes.get(sheet_name, {})
+                    for (r, c), fmt in user_fmt.items():
+                        self._apply_fmt_merged(ws.cell(row=r + 2, column=c + 1), fmt)
+
+                wb.save(file_path)
             else:
+                # CSV source: write fresh workbook via pandas
                 self.df.to_excel(file_path, index=False)
-                self.statusBar().showMessage("Saved successfully.", 3000)
+
+            n = len(self._excel_sheets)
+            self.statusBar().showMessage(
+                f"Saved {n} sheets." if n > 1 else "Saved.", 3000
+            )
         except Exception as e:
+            traceback.print_exc()
             QMessageBox.critical(self, "Error Saving File", str(e))
+
+    def _apply_fmt_merged(self, cell, user_fmt: dict):
+        """Merge user format changes onto the existing openpyxl cell font/fill,
+        preserving original font-family, underline, colour, etc."""
+        from openpyxl.styles import Font, PatternFill
+        from copy import copy
+        if any(k in user_fmt for k in ('bold', 'italic', 'size', 'fg')):
+            f = copy(cell.font)
+            kw = dict(
+                name=f.name, size=f.size, bold=f.bold, italic=f.italic,
+                underline=f.underline, strike=f.strike, color=f.color,
+                vertAlign=f.vertAlign, charset=f.charset, family=f.family,
+                scheme=f.scheme,
+            )
+            if 'bold'   in user_fmt: kw['bold']  = user_fmt['bold']
+            if 'italic' in user_fmt: kw['italic'] = user_fmt['italic']
+            if 'size'   in user_fmt: kw['size']   = user_fmt['size']
+            if 'fg'     in user_fmt: kw['color']  = 'FF' + user_fmt['fg'][1:]
+            cell.font = Font(**kw)
+        if 'bg' in user_fmt:
+            cell.fill = PatternFill(fill_type='solid',
+                                    fgColor='FF' + user_fmt['bg'][1:])
 
     def save_as_csv(self):
         if self.df is None:
@@ -1063,6 +1564,7 @@ class TableViewerApp(QMainWindow):
                 self.df.to_csv(file_path, index=False, encoding='utf-8-sig')
                 self.statusBar().showMessage("Saved successfully.", 3000)
             except Exception as e:
+                traceback.print_exc()
                 QMessageBox.critical(self, "Error Saving File", str(e))
 
     def _default_save_name(self, new_ext: str) -> str:
@@ -1132,6 +1634,7 @@ class TableViewerApp(QMainWindow):
                 "  → Table Viewer → Always use this app"
             )
         except Exception as e:
+            traceback.print_exc()
             QMessageBox.critical(self, "Registration Failed",
                                  f"Could not register file associations:\n\n{e}")
 
